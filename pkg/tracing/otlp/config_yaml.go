@@ -19,9 +19,17 @@ type retryConfig struct {
 	RetryMaxElapsedTime  time.Duration `yaml:"retry_max_elapsed_time"`
 }
 
+type TracingClientType string
+
+const (
+	TracingClientGRPC TracingClientType = "grpc"
+	TracingClientHTTP TracingClientType = "http"
+)
+
 type Config struct {
-	ClientType         string            `yaml:"client_type"`
+	ClientType         TracingClientType `yaml:"client_type"`
 	ServiceName        string            `yaml:"service_name"`
+	ResourceAttributes map[string]string `yaml:"resource_attributes"`
 	ReconnectionPeriod time.Duration     `yaml:"reconnection_period"`
 	Compression        string            `yaml:"compression"`
 	Insecure           bool              `yaml:"insecure"`

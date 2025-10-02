@@ -7,15 +7,18 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/cortexproject/promqlsmith"
 	"github.com/efficientgo/core/testutil"
 	"github.com/efficientgo/e2e"
 	e2edb "github.com/efficientgo/e2e/db"
@@ -23,10 +26,12 @@ import (
 	"github.com/efficientgo/e2e/monitoring/matchers"
 	e2eobs "github.com/efficientgo/e2e/observable"
 	"github.com/go-kit/log"
+	"github.com/google/go-cmp/cmp"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/model/timestamp"
+	"github.com/stretchr/testify/require"
 
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
@@ -72,7 +77,7 @@ metafile_content_ttl: 0s`, memcached.InternalEndpoint("memcached"))
 		e,
 		"1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		memcachedConfig,
@@ -108,13 +113,13 @@ metafile_content_ttl: 0s`, memcached.InternalEndpoint("memcached"))
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	id1, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc)
+	id1, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id2, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset2, 0, metadata.NoneFunc)
+	id2, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset2, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id3, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset3, 0, metadata.NoneFunc)
+	id3, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset3, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id4, err := e2eutil.CreateBlock(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset, 0, metadata.NoneFunc)
+	id4, err := e2eutil.CreateBlock(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	id5, err := e2eutil.CreateHistogramBlockWithDelay(ctx, dir, nativeHistogramSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset5, 0, metadata.NoneFunc)
 	testutil.Ok(t, err)
@@ -122,7 +127,7 @@ metafile_content_ttl: 0s`, memcached.InternalEndpoint("memcached"))
 	testutil.Ok(t, err)
 	l := log.NewLogfmtLogger(os.Stdout)
 	bkt, err := s3.NewBucketWithConfig(l,
-		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed")
+		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id1.String()), id1.String()))
@@ -274,7 +279,7 @@ metafile_content_ttl: 0s`, memcached.InternalEndpoint("memcached"))
 		testutil.Ok(t, s1.WaitSumMetrics(e2emon.Equals(8+3), "thanos_bucket_store_series_blocks_queried"))
 	})
 	t.Run("upload block id5, similar to id1", func(t *testing.T) {
-		id5, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset4, 0, metadata.NoneFunc)
+		id5, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, floatSeries, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset4, 0, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id5.String()), id5.String()))
 
@@ -408,7 +413,7 @@ func TestStoreGatewayNoCacheFile(t *testing.T) {
 		e,
 		"1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		"",
@@ -438,17 +443,17 @@ func TestStoreGatewayNoCacheFile(t *testing.T) {
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	id1, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc)
+	id1, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id2, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset2, 0, metadata.NoneFunc)
+	id2, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset2, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id3, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset3, 0, metadata.NoneFunc)
+	id3, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset3, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id4, err := e2eutil.CreateBlock(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset, 0, metadata.NoneFunc)
+	id4, err := e2eutil.CreateBlock(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	l := log.NewLogfmtLogger(os.Stdout)
 	bkt, err := s3.NewBucketWithConfig(l,
-		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed")
+		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id1.String()), id1.String()))
@@ -537,7 +542,7 @@ func TestStoreGatewayNoCacheFile(t *testing.T) {
 		testutil.Ok(t, s1.WaitSumMetrics(e2emon.Equals(4+1), "thanos_bucket_store_series_blocks_queried"))
 	})
 	t.Run("upload block id5, similar to id1", func(t *testing.T) {
-		id5, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset4, 0, metadata.NoneFunc)
+		id5, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset4, 0, metadata.NoneFunc, nil)
 		testutil.Ok(t, err)
 		testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id5.String()), id5.String()))
 
@@ -640,7 +645,7 @@ blocks_iter_ttl: 0s`, memcached.InternalEndpoint("memcached"))
 		e,
 		"1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		memcachedConfig,
@@ -662,12 +667,12 @@ blocks_iter_ttl: 0s`, memcached.InternalEndpoint("memcached"))
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc)
+	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 
 	l := log.NewLogfmtLogger(os.Stdout)
 	bkt, err := s3.NewBucketWithConfig(l,
-		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed")
+		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id.String()), id.String()))
@@ -749,7 +754,7 @@ metafile_content_ttl: 0s`
 		e,
 		"1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		fmt.Sprintf(groupcacheConfig, 1),
@@ -760,7 +765,7 @@ metafile_content_ttl: 0s`
 		e,
 		"2",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		fmt.Sprintf(groupcacheConfig, 2),
@@ -771,7 +776,7 @@ metafile_content_ttl: 0s`
 		e,
 		"3",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		fmt.Sprintf(groupcacheConfig, 3),
@@ -798,11 +803,11 @@ metafile_content_ttl: 0s`
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc)
+	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 
 	l := log.NewLogfmtLogger(os.Stdout)
-	bkt, err := s3.NewBucketWithConfig(l, e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed")
+	bkt, err := s3.NewBucketWithConfig(l, e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id.String()), id.String()))
@@ -868,7 +873,7 @@ config:
 		e,
 		"1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		string(cacheCfg),
@@ -880,7 +885,7 @@ config:
 		e,
 		"2",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		string(cacheCfg),
@@ -891,7 +896,7 @@ config:
 		e,
 		"3",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		string(cacheCfg),
@@ -919,17 +924,17 @@ config:
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	id1, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc)
+	id1, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id2, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset2, 0, metadata.NoneFunc)
+	id2, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset2, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id3, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset3, 0, metadata.NoneFunc)
+	id3, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset3, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
-	id4, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset4, 0, metadata.NoneFunc)
+	id4, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset4, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 	l := log.NewLogfmtLogger(os.Stdout)
 	bkt, err := s3.NewBucketWithConfig(l,
-		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed")
+		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id1.String()), id1.String()))
@@ -969,9 +974,7 @@ config:
 
 		testutil.Ok(t, runutil.RetryWithLog(log.NewLogfmtLogger(os.Stdout), 5*time.Second, ctx.Done(), func() error {
 			if _, _, _, err := promclient.NewDefaultClient().QueryInstant(ctx, urlParse(t, "http://"+q3.Endpoint("http")), testQuery, now, opts); err != nil {
-				if err != nil {
-					t.Logf("got error: %s", err)
-				}
+				t.Logf("got error: %s", err)
 				e := err.Error()
 				if strings.Contains(e, "load chunks") && strings.Contains(e, "exceeded bytes limit while fetching chunks: limit 310176 violated") {
 					return nil
@@ -1038,7 +1041,7 @@ config:
 		e,
 		"1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		"",
@@ -1060,12 +1063,12 @@ config:
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc)
+	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 
 	l := log.NewLogfmtLogger(os.Stdout)
 	bkt, err := s3.NewBucketWithConfig(l,
-		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed")
+		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id.String()), id.String()))
@@ -1134,7 +1137,7 @@ func TestStoreGatewayLazyExpandedPostingsEnabled(t *testing.T) {
 		e,
 		"1",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		"",
@@ -1145,7 +1148,7 @@ func TestStoreGatewayLazyExpandedPostingsEnabled(t *testing.T) {
 		e,
 		"2",
 		client.BucketConfig{
-			Type:   client.S3,
+			Type:   objstore.S3,
 			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
 		},
 		"",
@@ -1163,7 +1166,7 @@ func TestStoreGatewayLazyExpandedPostingsEnabled(t *testing.T) {
 
 	numSeries := 10000
 	ss := make([]labels.Labels, 0, 10000)
-	for i := 0; i < numSeries; i++ {
+	for i := range numSeries {
 		ss = append(ss, labels.FromStrings("a", strconv.Itoa(i), "b", "1"))
 	}
 	extLset := labels.FromStrings("ext1", "value1", "replica", "1")
@@ -1172,12 +1175,12 @@ func TestStoreGatewayLazyExpandedPostingsEnabled(t *testing.T) {
 	t.Cleanup(cancel)
 
 	now := time.Now()
-	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, ss, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc)
+	id, err := e2eutil.CreateBlockWithBlockDelay(ctx, dir, ss, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), 30*time.Minute, extLset, 0, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 
 	l := log.NewLogfmtLogger(os.Stdout)
 	bkt, err := s3.NewBucketWithConfig(l,
-		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed")
+		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
 	testutil.Ok(t, err)
 
 	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id.String()), id.String()))
@@ -1257,6 +1260,175 @@ func TestStoreGatewayLazyExpandedPostingsEnabled(t *testing.T) {
 	})
 
 	// Use greater or equal to handle flakiness.
-	testutil.Ok(t, s1.WaitSumMetrics(e2emon.GreaterOrEqual(1), "thanos_bucket_store_lazy_expanded_postings_total"), e2emon.WaitMissingMetrics())
-	testutil.Ok(t, s2.WaitSumMetrics(e2emon.Equals(0), "thanos_bucket_store_lazy_expanded_postings_total"), e2emon.WaitMissingMetrics())
+	testutil.Ok(t, s1.WaitSumMetricsWithOptions(e2emon.GreaterOrEqual(1), []string{"thanos_bucket_store_lazy_expanded_postings_total"}, e2emon.WaitMissingMetrics()))
+	testutil.Ok(t, s2.WaitSumMetricsWithOptions(e2emon.Equals(0), []string{"thanos_bucket_store_lazy_expanded_postings_total"}, e2emon.WaitMissingMetrics()))
+}
+
+var labelSetsComparer = cmp.Comparer(func(x, y []map[string]string) bool {
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		if !reflect.DeepEqual(x[i], y[i]) {
+			return false
+		}
+	}
+	return true
+})
+
+func TestStoreGatewayLazyExpandedPostingsPromQLSmithFuzz(t *testing.T) {
+	t.Skip("Skipping the testcase in CI due to its randomness.")
+
+	t.Parallel()
+
+	e, err := e2e.NewDockerEnvironment("fuzz-sg-lazy")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	const bucket = "fuzz-store-gateway-lazy-expanded-postings-test"
+	m := e2edb.NewMinio(e, "thanos-minio", bucket, e2edb.WithMinioTLS())
+	testutil.Ok(t, e2e.StartAndWaitReady(m))
+
+	// Create 2 store gateways, one with lazy expanded postings enabled and another one disabled.
+	s1 := e2ethanos.NewStoreGW(
+		e,
+		"1",
+		client.BucketConfig{
+			Type:   objstore.S3,
+			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
+		},
+		"",
+		"",
+		[]string{"--store.enable-lazy-expanded-postings"},
+	)
+	s2 := e2ethanos.NewStoreGW(
+		e,
+		"2",
+		client.BucketConfig{
+			Type:   objstore.S3,
+			Config: e2ethanos.NewS3Config(bucket, m.InternalEndpoint("http"), m.InternalDir()),
+		},
+		"",
+		"",
+		nil,
+	)
+	testutil.Ok(t, e2e.StartAndWaitReady(s1, s2))
+
+	q1 := e2ethanos.NewQuerierBuilder(e, "1", s1.InternalEndpoint("grpc")).Init()
+	q2 := e2ethanos.NewQuerierBuilder(e, "2", s2.InternalEndpoint("grpc")).Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(q1, q2))
+
+	dir := filepath.Join(e.SharedDir(), "tmp")
+	testutil.Ok(t, os.MkdirAll(dir, os.ModePerm))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	t.Cleanup(cancel)
+
+	rnd := rand.New(rand.NewSource(time.Now().Unix()))
+
+	now := time.Now()
+	start := now.Add(-time.Minute * 20)
+	startMs := start.UnixMilli()
+	end := now.Add(-time.Minute * 10)
+	endMs := end.UnixMilli()
+	numSeries := 1000
+	numSamples := 50
+	lbls := make([]labels.Labels, 0, numSeries)
+	scrapeInterval := (10 * time.Second).Milliseconds()
+	metricName := "http_requests_total"
+	statusCodes := []string{"200", "400", "404", "500", "502"}
+	extLset := labels.FromStrings("ext1", "value1", "replica", "1")
+	for i := range numSeries {
+		lbl := labels.FromStrings(labels.MetricName, metricName, "job", "test", "series", strconv.Itoa(i%200), "status_code", statusCodes[i%5])
+		lbls = append(lbls, lbl)
+	}
+	id, err := e2eutil.CreateBlockWithChurn(ctx, rnd, dir, lbls, numSamples, startMs, endMs, extLset, 0, scrapeInterval, 10)
+	testutil.Ok(t, err)
+	id, err = e2eutil.AddDelay(id, dir, 30*time.Minute)
+	testutil.Ok(t, err)
+
+	l := log.NewLogfmtLogger(os.Stdout)
+	bkt, err := s3.NewBucketWithConfig(l,
+		e2ethanos.NewS3Config(bucket, m.Endpoint("http"), m.Dir()), "test-feed", nil)
+	testutil.Ok(t, err)
+
+	testutil.Ok(t, objstore.UploadDir(ctx, l, bkt, path.Join(dir, id.String()), id.String()))
+
+	// Wait for store to sync blocks.
+	// thanos_blocks_meta_synced: 1x loadedMeta 0x labelExcludedMeta 0x TooFreshMeta.
+	testutil.Ok(t, s1.WaitSumMetrics(e2emon.Equals(1), "thanos_blocks_meta_synced"))
+	testutil.Ok(t, s1.WaitSumMetrics(e2emon.Equals(1), "thanos_bucket_store_blocks_loaded"))
+
+	testutil.Ok(t, s2.WaitSumMetrics(e2emon.Equals(1), "thanos_blocks_meta_synced"))
+	testutil.Ok(t, s2.WaitSumMetrics(e2emon.Equals(1), "thanos_bucket_store_blocks_loaded"))
+
+	opts := []promqlsmith.Option{
+		promqlsmith.WithEnforceLabelMatchers([]*labels.Matcher{
+			labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metricName),
+			labels.MustNewMatcher(labels.MatchEqual, "job", "test"),
+		}),
+	}
+	ps := promqlsmith.New(rnd, lbls, opts...)
+
+	type testCase struct {
+		matchers                     string
+		res1, newRes1, res2, newRes2 []map[string]string
+	}
+
+	cases := make([]*testCase, 0, 1000)
+
+	client := promclient.NewDefaultClient()
+
+	u1 := urlParse(t, "http://"+q1.Endpoint("http"))
+	u2 := urlParse(t, "http://"+q2.Endpoint("http"))
+	matcher := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metricName)
+	// Wait until series can be queried.
+	series(t, ctx, q1.Endpoint("http"), []*labels.Matcher{matcher}, startMs, endMs, 0, func(res []map[string]string) bool {
+		return len(res) > 0
+	})
+	series(t, ctx, q2.Endpoint("http"), []*labels.Matcher{matcher}, startMs, endMs, 0, func(res []map[string]string) bool {
+		return len(res) > 0
+	})
+
+	for range 1000 {
+		matchers := ps.WalkSelectors()
+		matcherStrings := storepb.PromMatchersToString(matchers...)
+		minT := e2eutil.RandRange(rnd, startMs, endMs)
+		maxT := e2eutil.RandRange(rnd, minT+1, endMs)
+
+		res1, err := client.SeriesInGRPC(ctx, u1, matchers, minT, maxT, 0)
+		testutil.Ok(t, err)
+		res2, err := client.SeriesInGRPC(ctx, u2, matchers, minT, maxT, 0)
+		testutil.Ok(t, err)
+
+		// Try again with a different timestamp and let requests hit posting cache.
+		minT = e2eutil.RandRange(rnd, startMs, endMs)
+		maxT = e2eutil.RandRange(rnd, minT+1, endMs)
+		newRes1, err := client.SeriesInGRPC(ctx, u1, matchers, minT, maxT, 0)
+		testutil.Ok(t, err)
+		newRes2, err := client.SeriesInGRPC(ctx, u2, matchers, minT, maxT, 0)
+		testutil.Ok(t, err)
+
+		cases = append(cases, &testCase{
+			matchers: matcherStrings,
+			res1:     res1,
+			newRes1:  newRes1,
+			res2:     res2,
+			newRes2:  newRes2,
+		})
+	}
+
+	failures := 0
+	for i, tc := range cases {
+		if !cmp.Equal(tc.res1, tc.res2, labelSetsComparer) {
+			t.Logf("case %d results mismatch for the first attempt.\n%s\nres1 len: %d data: %s\nres2 len: %d data: %s\n", i, tc.matchers, len(tc.res1), tc.res1, len(tc.res2), tc.res2)
+			failures++
+		} else if !cmp.Equal(tc.newRes1, tc.newRes2, labelSetsComparer) {
+			t.Logf("case %d results mismatch for the second attempt.\n%s\nres1 len: %d data: %s\nres2 len: %d data: %s\n", i, tc.matchers, len(tc.newRes1), tc.newRes1, len(tc.newRes2), tc.newRes2)
+			failures++
+		}
+	}
+	if failures > 0 {
+		require.Failf(t, "finished store gateway lazy expanded posting fuzzing tests", "%d test cases failed", failures)
+	}
 }

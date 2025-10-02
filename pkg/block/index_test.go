@@ -34,10 +34,10 @@ func TestRewrite(t *testing.T) {
 		labels.New(labels.Label{Name: "a", Value: "4"}),
 		labels.New(labels.Label{Name: "a", Value: "1"}),
 		labels.New(labels.Label{Name: "b", Value: "1"}),
-	}, 150, 0, 1000, labels.EmptyLabels(), 124, metadata.NoneFunc)
+	}, 150, 0, 1000, labels.EmptyLabels(), 124, metadata.NoneFunc, nil)
 	testutil.Ok(t, err)
 
-	ir, err := index.NewFileReader(filepath.Join(tmpDir, b.String(), IndexFilename))
+	ir, err := index.NewFileReader(filepath.Join(tmpDir, b.String(), IndexFilename), index.DecodePostingsRaw)
 	testutil.Ok(t, err)
 
 	defer func() { testutil.Ok(t, ir.Close()) }()
@@ -69,7 +69,7 @@ func TestRewrite(t *testing.T) {
 	testutil.Ok(t, iw.Close())
 	testutil.Ok(t, cw.Close())
 
-	ir2, err := index.NewFileReader(filepath.Join(tmpDir, m.ULID.String(), IndexFilename))
+	ir2, err := index.NewFileReader(filepath.Join(tmpDir, m.ULID.String(), IndexFilename), index.DecodePostingsRaw)
 	testutil.Ok(t, err)
 
 	defer func() { testutil.Ok(t, ir2.Close()) }()
@@ -89,12 +89,8 @@ func TestRewrite(t *testing.T) {
 
 func TestGatherIndexHealthStatsReturnsOutOfOrderChunksErr(t *testing.T) {
 	ctx := context.Background()
-	blockDir := t.TempDir()
 
-	err := e2eutil.PutOutOfOrderIndex(blockDir, 0, math.MaxInt64)
-	testutil.Ok(t, err)
-
-	stats, err := GatherIndexHealthStats(ctx, log.NewLogfmtLogger(os.Stderr), blockDir+"/"+IndexFilename, 0, math.MaxInt64)
+	stats, err := GatherIndexHealthStats(ctx, log.NewLogfmtLogger(os.Stderr), "testdata/out_of_order_chunks/index", 0, math.MaxInt64)
 
 	testutil.Ok(t, err)
 	testutil.Equals(t, 1, stats.OutOfOrderChunks)

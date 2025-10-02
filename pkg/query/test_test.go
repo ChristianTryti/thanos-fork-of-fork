@@ -24,6 +24,8 @@ import (
 	"github.com/prometheus/prometheus/promql/parser/posrange"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/teststorage"
+
+	"github.com/thanos-io/thanos/pkg/extpromql"
 )
 
 var (
@@ -53,7 +55,7 @@ func timeMilliseconds(t time.Time) int64 {
 type test struct {
 	testing.TB
 
-	cmds       []interface{}
+	cmds       []any
 	rootEngine *promql.Engine
 	stores     []*testStore
 
@@ -89,7 +91,7 @@ func (s *testStore) close(t testing.TB) {
 }
 
 // NewTest returns an initialized empty Test.
-// It's compatible with promql.Test, allowing additionally multi StoreAPIs for query pushdown testing.
+// It's compatible with promql.Test, allowing additionally multi StoreAPIs.
 // TODO(bwplotka): Move to unittest and add add support for multi-store upstream. See: https://github.com/prometheus/prometheus/pull/8300
 func newTest(t testing.TB, input string) (*test, error) {
 	cmds, err := parse(input)
@@ -154,7 +156,7 @@ func getLines(input string) []string {
 }
 
 // parse parses the given input and returns command sequence.
-func parse(input string) (cmds []interface{}, err error) {
+func parse(input string) (cmds []any, err error) {
 	lines := getLines(input)
 
 	// Scan for steps line by line.
@@ -163,7 +165,7 @@ func parse(input string) (cmds []interface{}, err error) {
 		if l == "" {
 			continue
 		}
-		var cmd interface{}
+		var cmd any
 
 		switch c := strings.ToLower(patSpace.Split(l, 2)[0]); {
 		case c == "clear":
@@ -185,7 +187,7 @@ func parse(input string) (cmds []interface{}, err error) {
 	return cmds, nil
 }
 
-func raise(line int, format string, v ...interface{}) error {
+func raise(line int, format string, v ...any) error {
 	return &parser.ParseErr{
 		LineOffset: line,
 		Err:        errors.Errorf(format, v...),
@@ -204,7 +206,7 @@ func (t *test) run(createQueryableFn func([]*testStore) storage.Queryable) error
 }
 
 // exec processes a single step of the test.
-func (t *test) exec(tc interface{}, createQueryableFn func([]*testStore) storage.Queryable) error {
+func (t *test) exec(tc any, createQueryableFn func([]*testStore) storage.Queryable) error {
 	switch cmd := tc.(type) {
 	case *clearCmd:
 		t.reset()
@@ -261,7 +263,7 @@ func ParseStore(lines []string, i int) (int, *storeCmd, error) {
 	}
 	parts := patStore.FindStringSubmatch(lines[i])
 
-	m, err := parser.ParseMetricSelector(parts[1])
+	m, err := extpromql.ParseMetricSelector(parts[1])
 	if err != nil {
 		return i, nil, raise(i, "invalid matcher definition %q: %s", parts[1], err)
 	}
@@ -322,7 +324,7 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 		at   = parts[2]
 		expr = parts[3]
 	)
-	_, err := parser.ParseExpr(expr)
+	_, err := extpromql.ParseExpr(expr)
 	if err != nil {
 		if perr, ok := err.(*parser.ParseErr); ok {
 			perr.LineOffset = i
@@ -356,7 +358,7 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 			break
 		}
 		if f, err := parseNumber(defLine); err == nil {
-			cmd.expect(0, nil, parser.SequenceValue{Value: f})
+			cmd.expect(0, parser.SequenceValue{Value: f})
 			break
 		}
 		metric, vals, err := parser.ParseSeriesDesc(defLine)
@@ -371,7 +373,7 @@ func ParseEval(lines []string, i int) (int, *evalCmd, error) {
 		if len(vals) > 1 {
 			return i, nil, raise(i, "expecting multiple values in instant evaluation not allowed")
 		}
-		cmd.expect(j, metric, vals...)
+		cmd.expectMetric(j, metric, vals...)
 	}
 	return i, cmd, nil
 }
@@ -478,13 +480,15 @@ func (ev *evalCmd) String() string {
 	return "eval"
 }
 
-// expect adds a new metric with a sequence of values to the set of expected
+// expect adds a sequence of values to the set of expected
 // results for the query.
-func (ev *evalCmd) expect(pos int, m labels.Labels, vals ...parser.SequenceValue) {
-	if m == nil {
-		ev.expected[0] = entry{pos: pos, vals: vals}
-		return
-	}
+func (ev *evalCmd) expect(pos int, vals ...parser.SequenceValue) {
+	ev.expected[0] = entry{pos: pos, vals: vals}
+}
+
+// expectMetric adds a new metric with a sequence of values to the set of expected
+// results for the query.
+func (ev *evalCmd) expectMetric(pos int, m labels.Labels, vals ...parser.SequenceValue) {
 	h := m.Hash()
 	ev.metrics[h] = m
 	ev.expected[h] = entry{pos: pos, vals: vals}

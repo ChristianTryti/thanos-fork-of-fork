@@ -19,13 +19,15 @@ package querysharding
 import (
 	"fmt"
 
-	lru "github.com/hashicorp/golang-lru"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/promql/parser"
+
+	"github.com/thanos-io/thanos/pkg/extpromql"
 )
 
 var (
-	notShardableErr = fmt.Errorf("expressions are not shardable")
+	errNotShardable = fmt.Errorf("expressions are not shardable")
 )
 
 type Analyzer interface {
@@ -38,14 +40,14 @@ type QueryAnalyzer struct{}
 
 type CachedQueryAnalyzer struct {
 	analyzer *QueryAnalyzer
-	cache    *lru.Cache
+	cache    *lru.Cache[string, cachedValue]
 }
 
 // NewQueryAnalyzer creates a new QueryAnalyzer.
 func NewQueryAnalyzer() *CachedQueryAnalyzer {
 	// Ignore the error check since it throws error
 	// only if size is <= 0.
-	cache, _ := lru.New(256)
+	cache, _ := lru.New[string, cachedValue](256)
 	return &CachedQueryAnalyzer{
 		analyzer: &QueryAnalyzer{},
 		cache:    cache,
@@ -61,7 +63,7 @@ func (a *CachedQueryAnalyzer) Analyze(query string) (QueryAnalysis, error) {
 	if a.cache.Contains(query) {
 		value, ok := a.cache.Get(query)
 		if ok {
-			return value.(cachedValue).QueryAnalysis, value.(cachedValue).err
+			return value.QueryAnalysis, value.err
 		}
 	}
 
@@ -88,7 +90,7 @@ func (a *CachedQueryAnalyzer) Analyze(query string) (QueryAnalysis, error) {
 //
 // The le label is excluded from sharding.
 func (a *QueryAnalyzer) Analyze(query string) (QueryAnalysis, error) {
-	expr, err := parser.ParseExpr(query)
+	expr, err := extpromql.ParseExpr(query)
 	if err != nil {
 		return nonShardableQuery(), err
 	}
@@ -102,13 +104,14 @@ func (a *QueryAnalyzer) Analyze(query string) (QueryAnalysis, error) {
 		switch n := node.(type) {
 		case *parser.Call:
 			if n.Func != nil {
-				if n.Func.Name == "label_join" || n.Func.Name == "label_replace" {
+				switch n.Func.Name {
+				case "label_join", "label_replace":
 					dstLabel := stringFromArg(n.Args[1])
 					dynamicLabels = append(dynamicLabels, dstLabel)
-				} else if n.Func.Name == "absent_over_time" || n.Func.Name == "absent" || n.Func.Name == "scalar" {
+				case "absent_over_time", "absent", "scalar":
 					isShardable = false
-					return notShardableErr
-				} else if n.Func.Name == "histogram_quantile" {
+					return errNotShardable
+				case "histogram_quantile":
 					analysis = analysis.scopeToLabels([]string{"le"}, false)
 				}
 			}

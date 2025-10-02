@@ -4,18 +4,23 @@
 package query
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/dedup"
 	"github.com/thanos-io/thanos/pkg/store"
+	storecache "github.com/thanos-io/thanos/pkg/store/cache"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/custom"
@@ -25,33 +30,63 @@ func TestMain(m *testing.M) {
 	custom.TolerantVerifyLeakMain(m)
 }
 
+type safeClients struct {
+	sync.RWMutex
+	clients []store.Client
+}
+
+func (sc *safeClients) get() []store.Client {
+	sc.RLock()
+	defer sc.RUnlock()
+	ret := make([]store.Client, len(sc.clients))
+	copy(ret, sc.clients)
+	return ret
+}
+
+func (sc *safeClients) reset() {
+	sc.Lock()
+	defer sc.Unlock()
+	sc.clients = sc.clients[:0]
+}
+
+func (sc *safeClients) append(c store.Client) {
+	sc.Lock()
+	defer sc.Unlock()
+	sc.clients = append(sc.clients, c)
+}
+
 func TestQuerier_Proxy(t *testing.T) {
 	files, err := filepath.Glob("testdata/promql/**/*.test")
 	testutil.Ok(t, err)
 	testutil.Equals(t, 10, len(files), "%v", files)
+	cache, err := storecache.NewMatchersCache()
+	testutil.Ok(t, err)
+
+	// to enable double_exponential_smoothing, refer to https://github.com/prometheus/prometheus/pull/14930
+	parser.EnableExperimentalFunctions = true
 
 	logger := log.NewLogfmtLogger(os.Stderr)
 	t.Run("proxy", func(t *testing.T) {
-		var clients []store.Client
+		var sc safeClients
 		q := NewQueryableCreator(
 			logger,
 			nil,
-			store.NewProxyStore(logger, nil, func() []store.Client { return clients },
-				component.Debug, nil, 5*time.Minute, store.EagerRetrieval),
+			store.NewProxyStore(logger, nil, func() []store.Client { return sc.get() },
+				component.Debug, labels.EmptyLabels(), 5*time.Minute, store.EagerRetrieval, store.WithMatcherCache(cache)),
 			1000000,
 			5*time.Minute,
+			dedup.AlgorithmPenalty,
 		)
 
 		createQueryableFn := func(stores []*testStore) storage.Queryable {
-			clients = clients[:0]
+			sc.reset()
 			for i, st := range stores {
 				m, err := storepb.PromMatchersToMatchers(st.matchers...)
 				testutil.Ok(t, err)
-
 				// TODO(bwplotka): Parse external labels.
-				clients = append(clients, &storetestutil.TestClient{
+				sc.append(&storetestutil.TestClient{
 					Name:        fmt.Sprintf("store number %v", i),
-					StoreClient: storepb.ServerAsClient(selectedStore(store.NewTSDBStore(logger, st.storage.DB, component.Debug, nil), m, st.mint, st.maxt), 0),
+					StoreClient: storepb.ServerAsClient(selectedStore(store.NewTSDBStore(logger, st.storage.DB, component.Debug, labels.EmptyLabels()), m, st.mint, st.maxt)),
 					MinTime:     st.mint,
 					MaxTime:     st.maxt,
 				})
@@ -60,7 +95,6 @@ func TestQuerier_Proxy(t *testing.T) {
 				nil,
 				nil,
 				0,
-				false,
 				false,
 				false,
 				nil,
@@ -95,21 +129,6 @@ func selectedStore(wrapped storepb.StoreServer, matchers []storepb.LabelMatcher,
 		mint:        mint,
 		maxt:        maxt,
 	}
-}
-
-func (s *selectStore) Info(ctx context.Context, r *storepb.InfoRequest) (*storepb.InfoResponse, error) {
-	resp, err := s.StoreServer.Info(ctx, r)
-	if err != nil {
-		return nil, err
-	}
-	if resp.MinTime < s.mint {
-		resp.MinTime = s.mint
-	}
-	if resp.MaxTime > s.maxt {
-		resp.MaxTime = s.maxt
-	}
-	// TODO(bwplotka): Match labelsets and expose only those?
-	return resp, nil
 }
 
 func (s *selectStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {

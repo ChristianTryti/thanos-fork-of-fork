@@ -6,31 +6,44 @@ package store
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
+	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/pkg/errors"
+
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
-	"golang.org/x/exp/slices"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
-	"github.com/efficientgo/core/testutil"
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/filesystem"
+
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/promclient"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
+	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
 	"github.com/thanos-io/thanos/pkg/testutil/custom"
 	"github.com/thanos-io/thanos/pkg/testutil/e2eutil"
 )
+
+func TestMain(m *testing.M) {
+	custom.TolerantVerifyLeakMain(m)
+}
 
 type labelNameCallCase struct {
 	matchers []storepb.LabelMatcher
@@ -62,8 +75,10 @@ type seriesCallCase struct {
 	expectErr      error
 }
 
+type startStoreFn func(t *testing.T, extLset labels.Labels, append func(app storage.Appender)) storepb.StoreServer
+
 // testStoreAPIsAcceptance tests StoreAPI from closed box perspective.
-func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset labels.Labels, append func(app storage.Appender)) storepb.StoreServer) {
+func testStoreAPIsAcceptance(t *testing.T, startStore startStoreFn) {
 	t.Helper()
 
 	now := time.Now()
@@ -98,6 +113,7 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 			},
 			labelValuesCalls: []labelValuesCallCase{
 				{start: timestamp.FromTime(minTime), end: timestamp.FromTime(maxTime), label: "foo", expectedValues: []string{"foovalue1"}},
+				{start: timestamp.FromTime(minTime), end: timestamp.FromTime(maxTime), label: "replica"},
 			},
 		},
 		{
@@ -232,7 +248,6 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 			appendFn: func(app storage.Appender) {
 				_, err := app.Append(0, labels.FromStrings("foo", "bar", "region", "somewhere"), 0, 0)
 				testutil.Ok(t, err)
-
 				testutil.Ok(t, app.Commit())
 			},
 			seriesCalls: []seriesCallCase{
@@ -246,6 +261,29 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 					expectedLabels: []labels.Labels{
 						labels.FromStrings("foo", "bar", "region", "eu-west"),
 					},
+				},
+			},
+		},
+		{
+			desc: "series matcher on other labels when requesting external labels",
+			appendFn: func(app storage.Appender) {
+				_, err := app.Append(0, labels.FromStrings("__name__", "up", "foo", "bar", "job", "C"), 0, 0)
+				testutil.Ok(t, err)
+				_, err = app.Append(0, labels.FromStrings("__name__", "up", "foo", "baz", "job", "C"), 0, 0)
+				testutil.Ok(t, err)
+
+				testutil.Ok(t, app.Commit())
+			},
+			labelValuesCalls: []labelValuesCallCase{
+				{
+					start: timestamp.FromTime(minTime),
+					end:   timestamp.FromTime(maxTime),
+					label: "region",
+					matchers: []storepb.LabelMatcher{
+						{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"},
+						{Type: storepb.LabelMatcher_EQ, Name: "job", Value: "C"},
+					},
+					expectedValues: []string{"eu-west"},
 				},
 			},
 		},
@@ -678,6 +716,74 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 				},
 			},
 		},
+		{
+			desc: "label values and names with non-equal matchers on external labels",
+			appendFn: func(app storage.Appender) {
+				_, err := app.Append(0, labels.FromStrings("__name__", "up", "foo", "bar"), 0, 0)
+				testutil.Ok(t, err)
+				testutil.Ok(t, app.Commit())
+			},
+			labelNameCalls: []labelNameCallCase{
+				{
+					start:         timestamp.FromTime(minTime),
+					end:           timestamp.FromTime(maxTime),
+					expectedNames: []string{"__name__", "foo", "region"},
+					matchers:      []storepb.LabelMatcher{{Type: storepb.LabelMatcher_RE, Name: "region", Value: ".*"}},
+				},
+			},
+			labelValuesCalls: []labelValuesCallCase{
+				{
+					start: timestamp.FromTime(minTime),
+					end:   timestamp.FromTime(maxTime),
+					label: "region",
+					matchers: []storepb.LabelMatcher{
+						{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "up"},
+						{Type: storepb.LabelMatcher_RE, Name: "region", Value: ".*"},
+					},
+					expectedValues: []string{"eu-west"},
+				},
+			},
+		},
+		{
+			desc: "label_values(kube_pod_info{}, pod) don't fetch postings for pod!=''",
+			appendFn: func(app storage.Appender) {
+				_, err := app.Append(0, labels.FromStrings("__name__", "up", "pod", "pod-1"), timestamp.FromTime(now), 1)
+				testutil.Ok(t, err)
+				_, err = app.Append(0, labels.FromStrings("__name__", "up", "pod", "pod-2"), timestamp.FromTime(now), 1)
+				testutil.Ok(t, err)
+				_, err = app.Append(0, labels.FromStrings("__name__", "kube_pod_info", "pod", "pod-1"), timestamp.FromTime(now), 1)
+				testutil.Ok(t, err)
+				testutil.Ok(t, app.Commit())
+			},
+			labelNameCalls: []labelNameCallCase{
+				{
+					start:         timestamp.FromTime(minTime),
+					end:           timestamp.FromTime(maxTime),
+					expectedNames: []string{"__name__", "pod", "region"},
+					matchers:      []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "kube_pod_info"}},
+				},
+				{
+					start:         timestamp.FromTime(minTime),
+					end:           timestamp.FromTime(maxTime),
+					expectedNames: []string{"__name__", "pod", "region"},
+				},
+			},
+			labelValuesCalls: []labelValuesCallCase{
+				{
+					start:          timestamp.FromTime(minTime),
+					end:            timestamp.FromTime(maxTime),
+					label:          "pod",
+					expectedValues: []string{"pod-1"},
+					matchers:       []storepb.LabelMatcher{{Type: storepb.LabelMatcher_EQ, Name: "__name__", Value: "kube_pod_info"}},
+				},
+				{
+					start:          timestamp.FromTime(minTime),
+					end:            timestamp.FromTime(maxTime),
+					label:          "pod",
+					expectedValues: []string{"pod-1", "pod-2"},
+				},
+			},
+		},
 	} {
 		t.Run(tc.desc, func(t *testing.T) {
 			appendFn := tc.appendFn
@@ -689,9 +795,10 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 			for _, c := range tc.labelNameCalls {
 				t.Run("label_names", func(t *testing.T) {
 					resp, err := store.LabelNames(context.Background(), &storepb.LabelNamesRequest{
-						Start:    c.start,
-						End:      c.end,
-						Matchers: c.matchers,
+						Start:                c.start,
+						End:                  c.end,
+						Matchers:             c.matchers,
+						WithoutReplicaLabels: []string{"replica"},
 					})
 					if c.expectErr != nil {
 						testutil.NotOk(t, err)
@@ -707,12 +814,13 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 				})
 			}
 			for _, c := range tc.labelValuesCalls {
-				t.Run("label_name_values", func(t *testing.T) {
+				t.Run("label_values", func(t *testing.T) {
 					resp, err := store.LabelValues(context.Background(), &storepb.LabelValuesRequest{
-						Start:    c.start,
-						End:      c.end,
-						Label:    c.label,
-						Matchers: c.matchers,
+						Start:                c.start,
+						End:                  c.end,
+						Label:                c.label,
+						Matchers:             c.matchers,
+						WithoutReplicaLabels: []string{"replica"},
 					})
 					if c.expectErr != nil {
 						testutil.NotOk(t, err)
@@ -731,10 +839,11 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 				t.Run("series", func(t *testing.T) {
 					srv := newStoreSeriesServer(context.Background())
 					err := store.Series(&storepb.SeriesRequest{
-						MinTime:    c.start,
-						MaxTime:    c.end,
-						Matchers:   c.matchers,
-						SkipChunks: c.skipChunks,
+						MinTime:              c.start,
+						MaxTime:              c.end,
+						Matchers:             c.matchers,
+						SkipChunks:           c.skipChunks,
+						WithoutReplicaLabels: []string{"replica"},
 					}, srv)
 					if c.expectErr != nil {
 						testutil.NotOk(t, err)
@@ -743,9 +852,9 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 					}
 					testutil.Ok(t, err)
 
-					testutil.Equals(t, true, slices.IsSortedFunc(srv.SeriesSet, func(x, y storepb.Series) int {
+					testutil.Assert(t, slices.IsSortedFunc(srv.SeriesSet, func(x, y storepb.Series) int {
 						return labels.Compare(x.PromLabels(), y.PromLabels())
-					}))
+					}), "Unsorted Series response returned")
 
 					receivedLabels := make([]labels.Labels, 0)
 					for _, s := range srv.SeriesSet {
@@ -759,12 +868,69 @@ func testStoreAPIsAcceptance(t *testing.T, startStore func(t *testing.T, extLset
 	}
 }
 
+// Regression test for https://github.com/thanos-io/thanos/issues/396.
+// Note: Only TSDB and Prometheus Stores do this.
+func testStoreAPIsSeriesSplitSamplesIntoChunksWithMaxSizeOf120(t *testing.T, startStore startStoreFn) {
+	t.Run("should split into chunks of max size 120", func(t *testing.T) {
+		baseT := timestamp.FromTime(time.Now().AddDate(0, 0, -2)) / 1000 * 1000
+		offset := int64(2*math.MaxUint16 + 5)
+
+		extLset := labels.FromStrings("region", "eu-west")
+		appendFn := func(app storage.Appender) {
+			var (
+				ref storage.SeriesRef
+				err error
+			)
+			for i := range offset {
+				ref, err = app.Append(ref, labels.FromStrings("a", "b"), baseT+i, 1)
+				testutil.Ok(t, err)
+			}
+			testutil.Ok(t, app.Commit())
+
+		}
+		ctx := t.Context()
+
+		client := startStore(t, extLset, appendFn)
+		srv := newStoreSeriesServer(ctx)
+
+		testutil.Ok(t, client.Series(&storepb.SeriesRequest{
+			MinTime: baseT,
+			MaxTime: baseT + offset,
+			Matchers: []storepb.LabelMatcher{
+				{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "b"},
+				{Type: storepb.LabelMatcher_EQ, Name: "region", Value: "eu-west"},
+			},
+		}, srv))
+
+		testutil.Equals(t, 1, len(srv.SeriesSet))
+
+		firstSeries := srv.SeriesSet[0]
+
+		testutil.Equals(t, []labelpb.ZLabel{
+			{Name: "a", Value: "b"},
+			{Name: "region", Value: "eu-west"},
+		}, firstSeries.Labels)
+
+		testutil.Equals(t, 1093, len(firstSeries.Chunks))
+		for i := 0; i < len(firstSeries.Chunks)-1; i++ {
+			chunk, err := chunkenc.FromData(chunkenc.EncXOR, firstSeries.Chunks[i].Raw.Data)
+			testutil.Ok(t, err)
+			testutil.Equals(t, 120, chunk.NumSamples())
+		}
+
+		chunk, err := chunkenc.FromData(chunkenc.EncXOR, firstSeries.Chunks[len(firstSeries.Chunks)-1].Raw.Data)
+		testutil.Ok(t, err)
+		testutil.Equals(t, 35, chunk.NumSamples())
+	})
+}
+
 func TestBucketStore_Acceptance(t *testing.T) {
-	t.Cleanup(func() { custom.TolerantVerifyLeak(t) })
+	t.Parallel()
+
 	ctx := context.Background()
 
-	for _, lazyExpandedPosting := range []bool{false, true} {
-		testStoreAPIsAcceptance(t, func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+	startStore := func(lazyExpandedPostings bool) func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+		return func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
 			tmpDir := tt.TempDir()
 			bktDir := filepath.Join(tmpDir, "bkt")
 			auxDir := filepath.Join(tmpDir, "aux")
@@ -791,29 +957,30 @@ func TestBucketStore_Acceptance(t *testing.T) {
 				tt.Skip("Bucket Store cannot handle empty HEAD")
 			}
 
-			id := createBlockFromHead(tt, auxDir, h)
+			for _, replica := range []string{"r1", "r2"} {
+				id := storetestutil.CreateBlockFromHead(tt, auxDir, h)
 
-			auxBlockDir := filepath.Join(auxDir, id.String())
-			meta, err := metadata.ReadFromDir(auxBlockDir)
-			testutil.Ok(t, err)
-			stats, err := block.GatherIndexHealthStats(ctx, logger, filepath.Join(auxBlockDir, block.IndexFilename), meta.MinTime, meta.MaxTime)
-			testutil.Ok(t, err)
-			_, err = metadata.InjectThanos(log.NewNopLogger(), auxBlockDir, metadata.Thanos{
-				Labels:     extLset.Map(),
-				Downsample: metadata.ThanosDownsample{Resolution: 0},
-				Source:     metadata.TestSource,
-				IndexStats: metadata.IndexStats{SeriesMaxSize: stats.SeriesMaxSize, ChunkMaxSize: stats.ChunkMaxSize},
-			}, nil)
-			testutil.Ok(tt, err)
+				auxBlockDir := filepath.Join(auxDir, id.String())
+				meta, err := metadata.ReadFromDir(auxBlockDir)
+				testutil.Ok(t, err)
+				stats, err := block.GatherIndexHealthStats(ctx, logger, filepath.Join(auxBlockDir, block.IndexFilename), meta.MinTime, meta.MaxTime)
+				testutil.Ok(t, err)
+				_, err = metadata.InjectThanos(log.NewNopLogger(), auxBlockDir, metadata.Thanos{
+					Labels:     labels.NewBuilder(extLset).Set("replica", replica).Labels().Map(),
+					Downsample: metadata.ThanosDownsample{Resolution: 0},
+					Source:     metadata.TestSource,
+					IndexStats: metadata.IndexStats{SeriesMaxSize: stats.SeriesMaxSize, ChunkMaxSize: stats.ChunkMaxSize},
+				}, nil)
+				testutil.Ok(tt, err)
 
-			testutil.Ok(tt, block.Upload(ctx, logger, bkt, auxBlockDir, metadata.NoneFunc))
-			testutil.Ok(tt, block.Upload(ctx, logger, bkt, auxBlockDir, metadata.NoneFunc))
+				testutil.Ok(tt, block.Upload(ctx, logger, bkt, auxBlockDir, metadata.NoneFunc))
+			}
 
 			chunkPool, err := NewDefaultChunkBytesPool(2e5)
 			testutil.Ok(tt, err)
 
 			insBkt := objstore.WithNoopInstr(bkt)
-			baseBlockIDsFetcher := block.NewBaseBlockIDsFetcher(logger, insBkt)
+			baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
 			metaFetcher, err := block.NewMetaFetcher(logger, 20, insBkt, baseBlockIDsFetcher, metaDir, nil, []block.MetadataFilter{
 				block.NewTimePartitionMetaFilter(allowAllFilterConf.MinTime, allowAllFilterConf.MaxTime),
 			})
@@ -835,7 +1002,7 @@ func TestBucketStore_Acceptance(t *testing.T) {
 				1*time.Minute,
 				WithChunkPool(chunkPool),
 				WithFilterConfig(allowAllFilterConf),
-				WithLazyExpandedPostings(lazyExpandedPosting),
+				WithLazyExpandedPostings(lazyExpandedPostings),
 			)
 			testutil.Ok(tt, err)
 			tt.Cleanup(func() { testutil.Ok(tt, bucketStore.Close()) })
@@ -843,14 +1010,20 @@ func TestBucketStore_Acceptance(t *testing.T) {
 			testutil.Ok(tt, bucketStore.SyncBlocks(context.Background()))
 
 			return bucketStore
+		}
+	}
+
+	for _, lazyExpandedPostings := range []bool{false, true} {
+		t.Run(fmt.Sprintf("lazyExpandedPostings:%t", lazyExpandedPostings), func(t *testing.T) {
+			testStoreAPIsAcceptance(t, startStore(lazyExpandedPostings))
 		})
 	}
 }
 
 func TestPrometheusStore_Acceptance(t *testing.T) {
-	t.Cleanup(func() { custom.TolerantVerifyLeak(t) })
+	t.Parallel()
 
-	testStoreAPIsAcceptance(t, func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+	startStore := func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
 		p, err := e2eutil.NewPrometheus()
 		testutil.Ok(tt, err)
 		tt.Cleanup(func() { testutil.Ok(tt, p.Stop()) })
@@ -870,21 +1043,251 @@ func TestPrometheusStore_Acceptance(t *testing.T) {
 			func() string { return version })
 		testutil.Ok(tt, err)
 
+		// We build chunks only for SAMPLES method. Make sure we ask for SAMPLES only.
+		promStore.remoteReadAcceptableResponses = []prompb.ReadRequest_ResponseType{prompb.ReadRequest_SAMPLES}
+
 		return promStore
-	})
+	}
+
+	testStoreAPIsAcceptance(t, startStore)
+	testStoreAPIsSeriesSplitSamplesIntoChunksWithMaxSizeOf120(t, startStore)
 }
 
 func TestTSDBStore_Acceptance(t *testing.T) {
-	t.Cleanup(func() { custom.TolerantVerifyLeak(t) })
+	t.Parallel()
 
-	testStoreAPIsAcceptance(t, func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+	startStore := func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
 		db, err := e2eutil.NewTSDB()
 		testutil.Ok(tt, err)
 		tt.Cleanup(func() { testutil.Ok(tt, db.Close()) })
-
-		tsdbStore := NewTSDBStore(nil, db, component.Rule, extLset)
-
 		appendFn(db.Appender(context.Background()))
-		return tsdbStore
+
+		return NewTSDBStore(nil, db, component.Rule, extLset)
+	}
+
+	testStoreAPIsAcceptance(t, startStore)
+	testStoreAPIsSeriesSplitSamplesIntoChunksWithMaxSizeOf120(t, startStore)
+}
+
+func TestProxyStoreWithTSDBSelector_Acceptance(t *testing.T) {
+	t.Skip("This is a known issue, we need to think how to fix it")
+
+	ctx := context.Background()
+
+	startStore := func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+		startNestedStore := func(tt *testing.T, appendFn func(app storage.Appender), extLsets ...labels.Labels) storepb.StoreServer {
+			tmpDir := tt.TempDir()
+			bktDir := filepath.Join(tmpDir, "bkt")
+			auxDir := filepath.Join(tmpDir, "aux")
+			metaDir := filepath.Join(tmpDir, "meta")
+
+			testutil.Ok(tt, os.MkdirAll(metaDir, os.ModePerm))
+			testutil.Ok(tt, os.MkdirAll(auxDir, os.ModePerm))
+
+			bkt, err := filesystem.NewBucket(bktDir)
+			testutil.Ok(tt, err)
+			tt.Cleanup(func() { testutil.Ok(tt, bkt.Close()) })
+
+			headOpts := tsdb.DefaultHeadOptions()
+			headOpts.ChunkDirRoot = tmpDir
+			headOpts.ChunkRange = 1000
+			h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
+			testutil.Ok(tt, err)
+			tt.Cleanup(func() { testutil.Ok(tt, h.Close()) })
+			logger := log.NewNopLogger()
+
+			appendFn(h.Appender(context.Background()))
+
+			if h.NumSeries() == 0 {
+				tt.Skip("Bucket Store cannot handle empty HEAD")
+			}
+
+			for _, extLset := range extLsets {
+				id := storetestutil.CreateBlockFromHead(tt, auxDir, h)
+
+				auxBlockDir := filepath.Join(auxDir, id.String())
+				meta, err := metadata.ReadFromDir(auxBlockDir)
+				testutil.Ok(t, err)
+				stats, err := block.GatherIndexHealthStats(ctx, logger, filepath.Join(auxBlockDir, block.IndexFilename), meta.MinTime, meta.MaxTime)
+				testutil.Ok(t, err)
+				_, err = metadata.InjectThanos(log.NewNopLogger(), auxBlockDir, metadata.Thanos{
+					Labels:     extLset.Map(),
+					Downsample: metadata.ThanosDownsample{Resolution: 0},
+					Source:     metadata.TestSource,
+					IndexStats: metadata.IndexStats{SeriesMaxSize: stats.SeriesMaxSize, ChunkMaxSize: stats.ChunkMaxSize},
+				}, nil)
+				testutil.Ok(tt, err)
+
+				testutil.Ok(tt, block.Upload(ctx, logger, bkt, auxBlockDir, metadata.NoneFunc))
+			}
+
+			chunkPool, err := NewDefaultChunkBytesPool(2e5)
+			testutil.Ok(tt, err)
+
+			insBkt := objstore.WithNoopInstr(bkt)
+			baseBlockIDsFetcher := block.NewConcurrentLister(logger, insBkt)
+			metaFetcher, err := block.NewMetaFetcher(logger, 20, insBkt, baseBlockIDsFetcher, metaDir, nil, []block.MetadataFilter{
+				block.NewTimePartitionMetaFilter(allowAllFilterConf.MinTime, allowAllFilterConf.MaxTime),
+			})
+			testutil.Ok(tt, err)
+
+			bucketStore, err := NewBucketStore(
+				objstore.WithNoopInstr(bkt),
+				metaFetcher,
+				"",
+				NewChunksLimiterFactory(10e6),
+				NewSeriesLimiterFactory(10e6),
+				NewBytesLimiterFactory(10e6),
+				NewGapBasedPartitioner(PartitionerMaxGapSize),
+				20,
+				true,
+				DefaultPostingOffsetInMemorySampling,
+				false,
+				false,
+				1*time.Minute,
+				WithChunkPool(chunkPool),
+				WithFilterConfig(allowAllFilterConf),
+			)
+			testutil.Ok(tt, err)
+			tt.Cleanup(func() { testutil.Ok(tt, bucketStore.Close()) })
+
+			testutil.Ok(tt, bucketStore.SyncBlocks(context.Background()))
+
+			return bucketStore
+		}
+
+		extLset1 := labels.NewBuilder(extLset).Set("L1", "A").Set("L2", "B").Labels()
+		extLset2 := labels.NewBuilder(extLset).Set("L1", "C").Set("L2", "D").Labels()
+		extLset3 := labels.NewBuilder(extLset).Set("L1", "A").Set("L2", "D").Labels()
+
+		p1 := startNestedStore(tt, appendFn, extLset1, extLset2, extLset3)
+
+		clients := []Client{
+			storetestutil.TestClient{StoreClient: storepb.ServerAsClient(p1), ExtLset: []labels.Labels{extLset1, extLset2, extLset3}},
+		}
+
+		relabelCfgs := []*relabel.Config{{
+			SourceLabels: model.LabelNames([]model.LabelName{"L1", "L2"}),
+			Separator:    "-",
+			Regex:        relabel.MustNewRegexp("(A-B|C-D)"),
+			Action:       relabel.Keep,
+		}}
+
+		return NewProxyStore(nil, nil, func() []Client { return clients }, component.Query, labels.EmptyLabels(), 0*time.Second, RetrievalStrategy(EagerRetrieval), WithTSDBSelector(NewTSDBSelector(relabelCfgs)))
+	}
+
+	client := startStore(t, labels.EmptyLabels(), func(app storage.Appender) {
+		_, err := app.Append(0, labels.FromStrings("a", "b"), 0, 0)
+		testutil.Ok(t, err)
+		testutil.Ok(t, app.Commit())
 	})
+	srv := newStoreSeriesServer(ctx)
+
+	testutil.Ok(t, client.Series(&storepb.SeriesRequest{
+		MinTime: minTime.Unix(),
+		MaxTime: maxTime.Unix(),
+		Matchers: []storepb.LabelMatcher{
+			{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "b"},
+		},
+	}, srv))
+
+	receivedLabels := make([]labels.Labels, 0)
+	for _, s := range srv.SeriesSet {
+		receivedLabels = append(receivedLabels, s.PromLabels())
+	}
+
+	// This fails currently because the method of using matchers cannot drop extLset3 even though we should only
+	// select extLset1 and extLset2 because of the TSDB Selector
+	testutil.Equals(t, receivedLabels, []labels.Labels{
+		labels.FromStrings("L1", "A", "L2", "B", "a", "b"),
+		labels.FromStrings("L1", "C", "L2", "D", "a", "b"),
+	})
+
+}
+
+func TestProxyStoreWithReplicas_Acceptance(t *testing.T) {
+	t.Parallel()
+
+	startStore := func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+		startNestedStore := func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+			db, err := e2eutil.NewTSDB()
+			testutil.Ok(tt, err)
+			tt.Cleanup(func() { testutil.Ok(tt, db.Close()) })
+			appendFn(db.Appender(context.Background()))
+
+			return NewTSDBStore(nil, db, component.Rule, extLset)
+
+		}
+
+		extLset1 := labels.NewBuilder(extLset).Set("replica", "r1").Labels()
+		extLset2 := labels.NewBuilder(extLset).Set("replica", "r2").Labels()
+
+		p1 := startNestedStore(tt, extLset1, appendFn)
+		p2 := startNestedStore(tt, extLset2, appendFn)
+
+		clients := []Client{
+			storetestutil.TestClient{StoreClient: storepb.ServerAsClient(p1), ExtLset: []labels.Labels{extLset1}},
+			storetestutil.TestClient{StoreClient: storepb.ServerAsClient(p2), ExtLset: []labels.Labels{extLset2}},
+		}
+
+		return NewProxyStore(nil, nil, func() []Client { return clients }, component.Query, labels.EmptyLabels(), 0*time.Second, RetrievalStrategy(EagerRetrieval))
+	}
+
+	testStoreAPIsAcceptance(t, startStore)
+}
+
+// TestTSDBSelectorFilteringBehavior tests that TSDBSelector properly filters stores
+// based on relabel configuration, ensuring that only matching stores are included
+// in TSDBInfos, LabelValues, and other metadata operations.
+func TestTSDBSelectorFilteringBehavior(t *testing.T) {
+	t.Parallel()
+
+	startStore := func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+		startNestedStore := func(tt *testing.T, extLset labels.Labels, appendFn func(app storage.Appender)) storepb.StoreServer {
+			db, err := e2eutil.NewTSDB()
+			testutil.Ok(tt, err)
+			tt.Cleanup(func() { testutil.Ok(tt, db.Close()) })
+			appendFn(db.Appender(context.Background()))
+
+			return NewTSDBStore(nil, db, component.Rule, extLset)
+		}
+
+		// this TSDB will be selected
+		store1 := startNestedStore(tt, extLset, appendFn)
+
+		// this TSDB should be dropped
+		droppedLset := labels.New(labels.Label{Name: "foo", Value: "bar"})
+		store2 := startNestedStore(tt, droppedLset, appendFn)
+
+		clients := []Client{
+			storetestutil.TestClient{
+				StoreClient: storepb.ServerAsClient(store1),
+				ExtLset:     []labels.Labels{extLset},
+			},
+			storetestutil.TestClient{
+				StoreClient: storepb.ServerAsClient(store2),
+				ExtLset:     []labels.Labels{droppedLset},
+			},
+		}
+
+		// Create relabel config to keep only the labels in the extLset
+		relabelCfgs := []*relabel.Config{{
+			SourceLabels: []model.LabelName{"foo"},
+			Regex:        relabel.MustNewRegexp("bar"),
+			Action:       relabel.Drop,
+		}}
+
+		return NewProxyStore(
+			nil, nil,
+			func() []Client { return clients },
+			component.Query,
+			labels.EmptyLabels(),
+			0*time.Second,
+			RetrievalStrategy(EagerRetrieval),
+			WithTSDBSelector(NewTSDBSelector(relabelCfgs)),
+		)
+	}
+
+	testStoreAPIsAcceptance(t, startStore)
+
 }

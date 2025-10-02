@@ -8,18 +8,15 @@ import (
 	"testing"
 	"time"
 
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
-
 	"github.com/efficientgo/core/testutil"
+	"github.com/pkg/errors"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tenancy"
-
-	"github.com/pkg/errors"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 
 	storetestutil "github.com/thanos-io/thanos/pkg/store/storepb/testutil"
 )
@@ -61,10 +58,6 @@ func getAndAssertTenant(ctx context.Context, t *testing.T) {
 	}
 	tenant := md.Get(tenancy.DefaultTenantHeader)[0]
 	testutil.Assert(t, tenant == testTenant)
-}
-
-func (s *mockedStoreAPI) Info(context.Context, *storepb.InfoRequest, ...grpc.CallOption) (*storepb.InfoResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
 func (s *mockedStoreAPI) Series(ctx context.Context, req *storepb.SeriesRequest, _ ...grpc.CallOption) (storepb.Store_SeriesClient, error) {
@@ -114,8 +107,7 @@ func TestTenantProxyPassing(t *testing.T) {
 	// outgoing grpc metadata
 	t.Run("tenant-via-context", func(t *testing.T) {
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 		ctx = context.WithValue(ctx, tenancy.TenantKey, testTenant)
 
 		mockedStore := &mockedStoreAPI{
@@ -137,7 +129,7 @@ func TestTenantProxyPassing(t *testing.T) {
 			nil,
 			func() []store.Client { return cls },
 			component.Query,
-			nil, 0*time.Second, store.EagerRetrieval,
+			labels.EmptyLabels(), 0*time.Second, store.EagerRetrieval,
 		)
 		// We assert directly in the mocked store apis LabelValues/LabelNames/Series funcs
 		_, _ = q.LabelValues(ctx, &storepb.LabelValuesRequest{})
@@ -157,8 +149,7 @@ func TestTenantProxyPassing(t *testing.T) {
 	// grpc metadata to be sent to its stores.
 	t.Run("tenant-via-grpc", func(t *testing.T) {
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
+		ctx := t.Context()
 
 		md := metadata.New(map[string]string{tenancy.DefaultTenantHeader: testTenant})
 		ctx = metadata.NewIncomingContext(ctx, md)
@@ -182,7 +173,7 @@ func TestTenantProxyPassing(t *testing.T) {
 			nil,
 			func() []store.Client { return cls },
 			component.Query,
-			nil, 0*time.Second, store.EagerRetrieval,
+			labels.EmptyLabels(), 0*time.Second, store.EagerRetrieval,
 		)
 
 		// We assert directly in the mocked store apis LabelValues/LabelNames/Series funcs
@@ -195,4 +186,38 @@ func TestTenantProxyPassing(t *testing.T) {
 
 		_ = q.Series(&storepb.SeriesRequest{Matchers: seriesMatchers}, &storeSeriesServer{ctx: ctx})
 	})
+}
+
+func TestEnforceQueryTenancy(t *testing.T) {
+	tests := []struct {
+		name          string
+		tenantLabel   string
+		tenant        string
+		query         string
+		expectedQuery string
+	}{
+		{
+			name:          "vector selector query",
+			tenantLabel:   "tenant_id",
+			tenant:        "test-tenant",
+			query:         `{__name__="test_metric", job="test_job"}`,
+			expectedQuery: `{__name__="test_metric",job="test_job",tenant_id="test-tenant"}`,
+		},
+		{
+			name:          "with aggregation and extended functions",
+			tenantLabel:   "tenant_id",
+			tenant:        "test-tenant",
+			query:         `sum by (job) (xrate(test_metric{job="test_job"}[5m]))`,
+			expectedQuery: `sum by (job) (xrate(test_metric{job="test_job",tenant_id="test-tenant"}[5m]))`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resultQuery, err := tenancy.EnforceQueryTenancy(tt.tenantLabel, tt.tenant, tt.query)
+			testutil.Ok(t, err)
+
+			testutil.Equals(t, tt.expectedQuery, resultQuery)
+		})
+	}
 }

@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"fmt"
 	"sync"
+
+	"github.com/pkg/errors"
 )
 
 // The MultiError type implements the error interface, and contains the
@@ -62,6 +64,42 @@ type NonNilMultiError MultiError
 
 // Returns a concatenated string of the contained errors.
 func (es NonNilMultiError) Error() string {
+	return multiErrorString(es)
+}
+
+func (es NonNilMultiError) Cause() error {
+	return es.getCause()
+}
+
+func (es NonNilMultiError) Is(target error) bool {
+	for _, err := range es {
+		if errors.Is(err, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func (es NonNilMultiError) getCause() NonNilMultiRootError {
+	var causes []error
+	for _, err := range es {
+		if multiErr, ok := errors.Cause(err).(NonNilMultiError); ok {
+			causes = append(causes, multiErr.getCause()...)
+		} else {
+			causes = append(causes, errors.Cause(err))
+		}
+	}
+	return causes
+}
+
+type NonNilMultiRootError MultiError
+
+// Returns a concatenated string of the contained errors.
+func (es NonNilMultiRootError) Error() string {
+	return multiErrorString(es)
+}
+
+func multiErrorString(es []error) string {
 	var buf bytes.Buffer
 
 	if len(es) > 1 {

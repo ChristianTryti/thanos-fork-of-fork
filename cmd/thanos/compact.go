@@ -42,10 +42,12 @@ import (
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
 	"github.com/thanos-io/thanos/pkg/logging"
+	"github.com/thanos-io/thanos/pkg/logutil"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/strutil"
 	"github.com/thanos-io/thanos/pkg/tracing"
 	"github.com/thanos-io/thanos/pkg/ui"
 )
@@ -205,7 +207,7 @@ func runCompact(
 		return err
 	}
 
-	bkt, err := client.NewBucket(logger, confContentYaml, component.String())
+	bkt, err := client.NewBucket(logger, confContentYaml, component.String(), nil)
 	if err != nil {
 		return err
 	}
@@ -239,17 +241,26 @@ func runCompact(
 	consistencyDelayMetaFilter := block.NewConsistencyDelayMetaFilter(logger, conf.consistencyDelay, extprom.WrapRegistererWithPrefix("thanos_", reg))
 	timePartitionMetaFilter := block.NewTimePartitionMetaFilter(conf.filterConf.MinTime, conf.filterConf.MaxTime)
 
-	baseBlockIDsFetcher := block.NewBaseBlockIDsFetcher(logger, insBkt)
-	baseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, insBkt, baseBlockIDsFetcher, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg))
+	var blockLister block.Lister
+	switch syncStrategy(conf.blockListStrategy) {
+	case concurrentDiscovery:
+		blockLister = block.NewConcurrentLister(logger, insBkt)
+	case recursiveDiscovery:
+		blockLister = block.NewRecursiveLister(logger, insBkt)
+	default:
+		return errors.Errorf("unknown sync strategy %s", conf.blockListStrategy)
+	}
+	baseMetaFetcher, err := block.NewBaseFetcher(logger, conf.blockMetaFetchConcurrency, insBkt, blockLister, conf.dataDir, extprom.WrapRegistererWithPrefix("thanos_", reg))
 	if err != nil {
 		return errors.Wrap(err, "create meta fetcher")
 	}
 
 	enableVerticalCompaction := conf.enableVerticalCompaction
-	if len(conf.dedupReplicaLabels) > 0 {
+	dedupReplicaLabels := strutil.ParseFlagLabels(conf.dedupReplicaLabels)
+	if len(dedupReplicaLabels) > 0 {
 		enableVerticalCompaction = true
 		level.Info(logger).Log(
-			"msg", "deduplication.replica-label specified, enabling vertical compaction", "dedupReplicaLabels", strings.Join(conf.dedupReplicaLabels, ","),
+			"msg", "deduplication.replica-label specified, enabling vertical compaction", "dedupReplicaLabels", strings.Join(dedupReplicaLabels, ","),
 		)
 	}
 	if enableVerticalCompaction {
@@ -267,7 +278,7 @@ func runCompact(
 			labelShardedMetaFilter,
 			consistencyDelayMetaFilter,
 			ignoreDeletionMarkFilter,
-			block.NewReplicaLabelRemover(logger, conf.dedupReplicaLabels),
+			block.NewReplicaLabelRemover(logger, dedupReplicaLabels),
 			duplicateBlocksFilter,
 			noCompactMarkerFilter,
 		}
@@ -280,6 +291,11 @@ func runCompact(
 		cf.UpdateOnChange(func(blocks []metadata.Meta, err error) {
 			api.SetLoaded(blocks, err)
 		})
+
+		var syncMetasTimeout = conf.waitInterval
+		if !conf.wait {
+			syncMetasTimeout = 0
+		}
 		sy, err = compact.NewMetaSyncer(
 			logger,
 			reg,
@@ -289,6 +305,7 @@ func runCompact(
 			ignoreDeletionMarkFilter,
 			compactMetrics.blocksMarked.WithLabelValues(metadata.DeletionMarkFilename, ""),
 			compactMetrics.garbageCollectedBlocks,
+			syncMetasTimeout,
 		)
 		if err != nil {
 			return errors.Wrap(err, "create syncer")
@@ -318,7 +335,7 @@ func runCompact(
 	case compact.DedupAlgorithmPenalty:
 		mergeFunc = dedup.NewChunkSeriesMerger()
 
-		if len(conf.dedupReplicaLabels) == 0 {
+		if len(dedupReplicaLabels) == 0 {
 			return errors.New("penalty based deduplication needs at least one replica label specified")
 		}
 	case "":
@@ -330,7 +347,7 @@ func runCompact(
 
 	// Instantiate the compactor with different time slices. Timestamps in TSDB
 	// are in milliseconds.
-	comp, err := tsdb.NewLeveledCompactor(ctx, reg, logger, levels, downsample.NewPool(), mergeFunc)
+	comp, err := tsdb.NewLeveledCompactor(ctx, reg, logutil.GoKitLogToSlog(logger), levels, downsample.NewPool(), mergeFunc)
 	if err != nil {
 		return errors.Wrap(err, "create compactor")
 	}
@@ -361,13 +378,20 @@ func runCompact(
 		conf.blockFilesConcurrency,
 		conf.compactBlocksFetchConcurrency,
 	)
+	var planner compact.Planner
+
 	tsdbPlanner := compact.NewPlanner(logger, levels, noCompactMarkerFilter)
-	planner := compact.WithLargeTotalIndexSizeFilter(
+	largeIndexFilterPlanner := compact.WithLargeTotalIndexSizeFilter(
 		tsdbPlanner,
 		insBkt,
 		int64(conf.maxBlockIndexSize),
 		compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.IndexSizeExceedingNoCompactReason),
 	)
+	if enableVerticalCompaction {
+		planner = compact.WithVerticalCompactionDownsampleFilter(largeIndexFilterPlanner, insBkt, compactMetrics.blocksMarked.WithLabelValues(metadata.NoCompactMarkFilename, metadata.DownsampleVerticalCompactionNoCompactReason))
+	} else {
+		planner = largeIndexFilterPlanner
+	}
 	blocksCleaner := compact.NewBlocksCleaner(logger, insBkt, ignoreDeletionMarkFilter, deleteDelay, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
 	compactor, err := compact.NewBucketCompactor(
 		logger,
@@ -379,6 +403,7 @@ func runCompact(
 		insBkt,
 		conf.compactionConcurrency,
 		conf.skipBlockWithOutOfOrderChunks,
+		blocksCleaner,
 	)
 	if err != nil {
 		return errors.Wrap(err, "create bucket compactor")
@@ -414,14 +439,7 @@ func runCompact(
 		cleanMtx.Lock()
 		defer cleanMtx.Unlock()
 
-		if err := sy.SyncMetas(ctx); err != nil {
-			return errors.Wrap(err, "syncing metas")
-		}
-
-		compact.BestEffortCleanAbortedPartialUploads(ctx, logger, sy.Partial(), insBkt, compactMetrics.partialUploadDeleteAttempts, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures)
-		if err := blocksCleaner.DeleteMarkedBlocks(ctx); err != nil {
-			return errors.Wrap(err, "cleaning marked blocks")
-		}
+		compact.BestEffortCleanAbortedPartialUploads(ctx, logger, sy.Partial(), insBkt, compactMetrics.partialUploadDeleteAttempts, compactMetrics.blocksCleaned, compactMetrics.blockCleanupFailures, ignoreDeletionMarkFilter.DeletionMarkBlocks())
 		compactMetrics.cleanups.Inc()
 
 		return nil
@@ -448,9 +466,9 @@ func runCompact(
 			}
 
 			for _, meta := range filteredMetas {
-				groupKey := meta.Thanos.GroupKey()
-				downsampleMetrics.downsamples.WithLabelValues(groupKey)
-				downsampleMetrics.downsampleFailures.WithLabelValues(groupKey)
+				resolutionLabel := meta.Thanos.ResolutionString()
+				downsampleMetrics.downsamples.WithLabelValues(resolutionLabel)
+				downsampleMetrics.downsampleFailures.WithLabelValues(resolutionLabel)
 			}
 
 			if err := downsampleBucket(
@@ -471,6 +489,14 @@ func runCompact(
 			level.Info(logger).Log("msg", "start second pass of downsampling")
 			if err := sy.SyncMetas(ctx); err != nil {
 				return errors.Wrap(err, "sync before second pass of downsampling")
+			}
+
+			// Regenerate the filtered list of blocks after the sync,
+			// to include the blocks created by the first pass.
+			filteredMetas = sy.Metas()
+			noDownsampleBlocks = noDownsampleMarkerFilter.NoDownsampleMarkedBlocks()
+			for ul := range noDownsampleBlocks {
+				delete(filteredMetas, ul)
 			}
 
 			if err := downsampleBucket(
@@ -693,6 +719,7 @@ type compactConfig struct {
 	wait                                           bool
 	waitInterval                                   time.Duration
 	disableDownsampling                            bool
+	blockListStrategy                              string
 	blockMetaFetchConcurrency                      int
 	blockFilesConcurrency                          int
 	blockViewerSyncBlockInterval                   time.Duration
@@ -754,6 +781,9 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		"as querying long time ranges without non-downsampled data is not efficient and useful e.g it is not possible to render all samples for a human eye anyway").
 		Default("false").BoolVar(&cc.disableDownsampling)
 
+	strategies := strings.Join([]string{string(concurrentDiscovery), string(recursiveDiscovery)}, ", ")
+	cmd.Flag("block-discovery-strategy", "One of "+strategies+". When set to concurrent, stores will concurrently issue one call per directory to discover active blocks in the bucket. The recursive strategy iterates through all objects in the bucket, recursively traversing into each directory. This avoids N+1 calls at the expense of having slower bucket iterations.").
+		Default(string(concurrentDiscovery)).StringVar(&cc.blockListStrategy)
 	cmd.Flag("block-meta-fetch-concurrency", "Number of goroutines to use when fetching block metadata from object storage.").
 		Default("32").IntVar(&cc.blockMetaFetchConcurrency)
 	cmd.Flag("block-files-concurrency", "Number of goroutines to use when fetching/uploading block files from object storage.").
@@ -791,8 +821,9 @@ func (cc *compactConfig) registerFlag(cmd extkingpin.FlagClause) {
 		"When set to penalty, penalty based deduplication algorithm will be used. At least one replica label has to be set via --deduplication.replica-label flag.").
 		Default("").EnumVar(&cc.dedupFunc, compact.DedupAlgorithmPenalty, "")
 
-	cmd.Flag("deduplication.replica-label", "Label to treat as a replica indicator of blocks that can be deduplicated (repeated flag). This will merge multiple replica blocks into one. This process is irreversible."+
-		"Experimental. When one or more labels are set, compactor will ignore the given labels so that vertical compaction can merge the blocks."+
+	cmd.Flag("deduplication.replica-label", "Experimental. Label to treat as a replica indicator of blocks that can be deduplicated (repeated flag). This will merge multiple replica blocks into one. This process is irreversible. "+
+		"Flag may be specified multiple times as well as a comma separated list of labels. "+
+		"When one or more labels are set, compactor will ignore the given labels so that vertical compaction can merge the blocks."+
 		"Please note that by default this uses a NAIVE algorithm for merging which works well for deduplication of blocks with **precisely the same samples** like produced by Receiver replication."+
 		"If you need a different deduplication algorithm (e.g one that works well with Prometheus replicas), please set it via --deduplication.func.").
 		StringsVar(&cc.dedupReplicaLabels)

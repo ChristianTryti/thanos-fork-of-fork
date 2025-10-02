@@ -88,6 +88,18 @@ See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/main/mi
 
 ## Talks
 
+* 2024
+  * [Enlightning - Scaling Your Metrics with Thanos](https://www.youtube.com/live/1qvcVJiVx7M)
+  * [6 Learnings from Building Thanos Project](https://www.youtube.com/watch?v=ur8dDFaNEFg)
+  * [Monitoring the World: Scaling Thanos in Dynamic Prometheus Environments](https://www.youtube.com/watch?v=ofhvbG0iTjU)
+  * [Scaling Thanos at Reddit](https://www.youtube.com/watch?v=c18RGbAxCfI)
+  * [Thanos Project Updates](https://www.youtube.com/watch?v=wmNtCj5D4_A)
+  * [Connecting Thanos to the Outer Rim via Query API](https://www.youtube.com/watch?v=E8L8fuRj66o)
+  * [Multiverse of Thanos: Making Thanos Multi-Tenanted](https://www.youtube.com/watch?v=SAyPQ2d8v4Q)
+  * [Thanos Receiver Deep Dive](https://www.youtube.com/watch?v=jn_zIfBuUyE)
+  * [From UI to Storage: Unraveling the Magic of Thanos Query Processing](https://www.youtube.com/watch?v=ZGQIitaKoTM)
+  * [Thanos’ Infinity Stones and How You Can Operate Them!](https://www.youtube.com/watch?v=e8kvX6mRlyE)
+
 * 2023
   * [Planetscale monitoring: Handling billions of active series with Prometheus and Thanos](https://www.youtube.com/watch?v=Or8r46fSaOg)
   * [Taming the Tsunami: low latency ingestion of push-based metrics in Prometheus](https://www.youtube.com/watch?v=W81x1j765hc)
@@ -125,19 +137,23 @@ See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/main/mi
 
 ## Blog posts
 
+* 2024:
+  * [Scaling Prometheus with Thanos.](https://www.cloudraft.io/blog/scaling-prometheus-with-thanos)
+  * [Streamlining Long-Term Storage Query Performance for Metrics With Thanos.](https://blog.devops.dev/streamlining-long-term-storage-query-performance-for-metrics-with-thanos-b44419c70cc4)
+
 * 2023:
   * [Thanos Ruler and Prometheus Rules — a match made in heaven.](https://medium.com/@helia.barroso/thanos-ruler-and-prometheus-rules-a-match-made-in-heaven-a4f08f2399ac)
 
 * 2022:
   * [Thanos at Medallia: A Hybrid Architecture Scaled to Support 1 Billion+ Series Across 40+ Data Centers](https://thanos.io/blog/2022-09-08-thanos-at-medallia/)
   * [Deploy Thanos Receive with native OCI Object Storage on Oracle Kubernetes Engine](https://medium.com/@lmukadam/deploy-thanos-receive-with-native-oci-object-storage-on-kubernetes-829326ea0bc6)
-  * [Leveraging Consul for Thanos Query Discovery](https://nicolastakashi.medium.com/leveraging-consul-for-thanos-query-discovery-34212d496c88)
+  * [Leveraging Consul for Thanos Query Discovery](https://itnext.io/leveraging-consul-for-thanos-query-discovery-34212d496c88)
 
 * 2021:
   * [Adopting Thanos at LastPass](https://krisztianfekete.org/adopting-thanos-at-lastpass/)
 
 * 2020:
-  * [Banzai Cloud user story](https://banzaicloud.com/blog/multi-cluster-monitoring/)
+  * [Banzai Cloud user story](https://outshift.cisco.com/blog/multi-cluster-monitoring)
   * [Monitoring the Beat microservices: A tale of evolution](https://build.thebeat.co/monitoring-the-beat-microservices-a-tale-of-evolution-4e246882606e)
 
 * 2019:
@@ -146,7 +162,7 @@ See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/main/mi
   * [HelloFresh blog posts part 1](https://engineering.hellofresh.com/monitoring-at-hellofresh-part-1-architecture-677b4bd6b728)
   * [HelloFresh blog posts part 2](https://engineering.hellofresh.com/monitoring-at-hellofresh-part-2-operating-the-monitoring-system-8175cd939c1d)
   * [Thanos deployment](https://www.metricfire.com/blog/ha-kubernetes-monitoring-using-prometheus-and-thanos)
-  * [Taboola user story](https://blog.taboola.com/monitoring-and-metering-scale/)
+  * [Taboola user story](https://www.taboola.com/engineering/monitoring-and-metering-scale/)
   * [Thanos via Prometheus Operator](https://kkc.github.io/2019/02/10/prometheus-operator-with-thanos/)
 
 * 2018:

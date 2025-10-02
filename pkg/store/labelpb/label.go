@@ -12,8 +12,10 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"unsafe"
 
+	"github.com/VictoriaMetrics/easyproto"
 	"github.com/cespare/xxhash/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/model/labels"
@@ -28,12 +30,12 @@ var (
 	sep = []byte{'\xff'}
 )
 
-func noAllocString(buf []byte) string {
-	return *(*string)(unsafe.Pointer(&buf))
+func safeBytes(buf string) []byte {
+	return []byte(buf)
 }
 
-func noAllocBytes(buf string) []byte {
-	return *(*[]byte)(unsafe.Pointer(&buf))
+func safeString(buf []byte) string {
+	return string(buf)
 }
 
 // ZLabelsFromPromLabels converts Prometheus labels to slice of labelpb.ZLabel in type unsafe manner.
@@ -65,8 +67,8 @@ func ReAllocZLabelsStrings(lset *[]ZLabel, intern bool) {
 	}
 
 	for j, l := range *lset {
-		(*lset)[j].Name = string(noAllocBytes(l.Name))
-		(*lset)[j].Value = string(noAllocBytes(l.Value))
+		(*lset)[j].Name = string(safeBytes(l.Name))
+		(*lset)[j].Value = string(safeBytes(l.Value))
 	}
 }
 
@@ -80,7 +82,7 @@ func internLabelString(s string) string {
 // detachAndInternLabelString reallocates the label string to detach it
 // from a bigger memory pool and interns the string.
 func detachAndInternLabelString(s string) string {
-	return internLabelString(string(noAllocBytes(s)))
+	return internLabelString(string(safeBytes(s)))
 }
 
 // ZLabelSetsToPromLabelSets converts slice of labelpb.ZLabelSet to slice of Prometheus labels.
@@ -191,7 +193,7 @@ func (m *ZLabel) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Name = noAllocString(data[iNdEx:postIndex])
+			m.Name = safeString(data[iNdEx:postIndex])
 			iNdEx = postIndex
 		case 2:
 			if wireType != 2 {
@@ -223,7 +225,7 @@ func (m *ZLabel) Unmarshal(data []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Value = noAllocString(data[iNdEx:postIndex])
+			m.Value = safeString(data[iNdEx:postIndex])
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
@@ -291,40 +293,14 @@ func (m *ZLabel) Compare(other ZLabel) int {
 // The type conversion is done safely, which means we don't modify extend labels underlying array.
 //
 // In case of existing labels already present in given label set, it will be overwritten by external one.
-// NOTE: Labels and extend has to be sorted.
-func ExtendSortedLabels(lset labels.Labels, extend []labels.Label) labels.Labels {
-	if len(extend) == 0 {
+func ExtendSortedLabels(lset, extend labels.Labels) labels.Labels {
+	if extend.IsEmpty() {
 		return lset.Copy()
 	}
-	b := labels.NewScratchBuilder(lset.Len() + len(extend))
-	lset.Range(func(l labels.Label) {
-		for {
-			if len(extend) == 0 {
-				b.Add(l.Name, l.Value)
-				break
-			} else {
-				e := extend[0]
-				d := strings.Compare(l.Name, e.Name)
-				if d == 0 {
-					// Duplicate, prefer external labels.
-					// NOTE(fabxc): Maybe move it to a prefixed version to still ensure uniqueness of series?
-					b.Add(e.Name, e.Value)
-					extend = extend[1:]
-					break
-				} else if d < 0 {
-					b.Add(l.Name, l.Value)
-					break
-				} else if d > 0 {
-					b.Add(e.Name, e.Value)
-					extend = extend[1:]
-				}
-			}
-		}
+	b := labels.NewBuilder(lset)
+	extend.Range(func(l labels.Label) {
+		b.Set(l.Name, l.Value)
 	})
-	for j := 0; j < len(extend); j++ {
-		b.Add(extend[j].Name, extend[j].Value)
-	}
-
 	return b.Labels()
 }
 
@@ -359,8 +335,8 @@ func (m *ZLabelSet) PromLabels() labels.Labels {
 func DeepCopy(lbls []ZLabel) []ZLabel {
 	ret := make([]ZLabel, len(lbls))
 	for i := range lbls {
-		ret[i].Name = string(noAllocBytes(lbls[i].Name))
-		ret[i].Value = string(noAllocBytes(lbls[i].Value))
+		ret[i].Name = string(safeBytes(lbls[i].Name))
+		ret[i].Value = string(safeBytes(lbls[i].Value))
 	}
 	return ret
 }
@@ -450,4 +426,68 @@ func (z ZLabelSets) Less(i, j int) bool {
 	}
 
 	return l == lenI
+}
+
+type CustomLabelset labels.Labels
+
+var builderPool = &sync.Pool{
+	New: func() any {
+		b := labels.NewScratchBuilder(8)
+		return &b
+	},
+}
+
+func (l *CustomLabelset) UnmarshalProtobuf(src []byte) (err error) {
+	b := builderPool.Get().(*labels.ScratchBuilder)
+	b.Reset()
+
+	defer builderPool.Put(b)
+
+	var fc easyproto.FieldContext
+
+	for len(src) > 0 {
+		src, err = fc.NextField(src)
+		if err != nil {
+			return errors.Wrap(err, "unmarshal next field")
+		}
+
+		if fc.FieldNum != 1 {
+			return fmt.Errorf("expected field 1, got %d", fc.FieldNum)
+		}
+
+		dat, ok := fc.MessageData()
+		if !ok {
+			return fmt.Errorf("expected message data for field %d", fc.FieldNum)
+		}
+
+		var n, v string
+		var msgFc easyproto.FieldContext
+		for len(dat) > 0 {
+			dat, err = msgFc.NextField(dat)
+			if err != nil {
+				return errors.Wrap(err, "unmarshal next field in message")
+			}
+
+			switch msgFc.FieldNum {
+			case 1:
+				n, ok = msgFc.String()
+				if !ok {
+					return fmt.Errorf("expected string data for field %d", msgFc.FieldNum)
+				}
+			case 2:
+				v, ok = msgFc.String()
+				if !ok {
+					return fmt.Errorf("expected string data for field %d", msgFc.FieldNum)
+				}
+			default:
+				return fmt.Errorf("unexpected field %d in label message", msgFc.FieldNum)
+			}
+		}
+
+		b.Add(n, v)
+
+	}
+
+	*l = CustomLabelset(b.Labels())
+	return nil
 }

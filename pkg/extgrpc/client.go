@@ -9,8 +9,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware/v2"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-middleware/providers/prometheus"
 	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
@@ -18,14 +17,16 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
 
+	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 // EndpointGroupGRPCOpts creates gRPC dial options for connecting to endpoint groups.
 // For details on retry capabilities, see https://github.com/grpc/proposal/blob/master/A6-client-retries.md#retry-policy-capabilities
-func EndpointGroupGRPCOpts() []grpc.DialOption {
-	serviceConfig := `
+func EndpointGroupGRPCOpts(serviceConfig string) []grpc.DialOption {
+	if serviceConfig == "" {
+		serviceConfig = `
 {
   "loadBalancingPolicy":"round_robin",
   "retryPolicy": {
@@ -37,6 +38,7 @@ func EndpointGroupGRPCOpts() []grpc.DialOption {
     ]
   }
 }`
+	}
 
 	return []grpc.DialOption{
 		grpc.WithDefaultServiceConfig(serviceConfig),
@@ -46,9 +48,14 @@ func EndpointGroupGRPCOpts() []grpc.DialOption {
 
 // StoreClientGRPCOpts creates gRPC dial options for connecting to a store client.
 func StoreClientGRPCOpts(logger log.Logger, reg prometheus.Registerer, tracer opentracing.Tracer, secure, skipVerify bool, cert, key, caCert, serverName string) ([]grpc.DialOption, error) {
-	grpcMets := grpc_prometheus.NewClientMetrics()
-	grpcMets.EnableClientHandlingTimeHistogram(
-		grpc_prometheus.WithHistogramBuckets([]float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120, 240, 360, 720}),
+	grpcMets := grpc_prometheus.NewClientMetrics(
+		grpc_prometheus.WithClientHandlingTimeHistogram(grpc_prometheus.WithHistogramOpts(
+			&prometheus.HistogramOpts{
+				Buckets:                        []float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120, 240, 360, 720},
+				NativeHistogramMaxBucketNumber: 256,
+				NativeHistogramBucketFactor:    1.1,
+			},
+		)),
 	)
 	dialOpts := []grpc.DialOption{
 		// We want to make sure that we can receive huge gRPC messages from storeAPI.
@@ -56,18 +63,17 @@ func StoreClientGRPCOpts(logger log.Logger, reg prometheus.Registerer, tracer op
 		// Current limit is ~2GB.
 		// TODO(bplotka): Split sent chunks on store node per max 4MB chunks if needed.
 		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(math.MaxInt32)),
-		grpc.WithUnaryInterceptor(
-			grpc_middleware.ChainUnaryClient(
-				grpcMets.UnaryClientInterceptor(),
-				tracing.UnaryClientInterceptor(tracer),
-			),
+		grpc.WithChainUnaryInterceptor(
+			grpcserver.NewUnaryClientRequestIDInterceptor(),
+			grpcMets.UnaryClientInterceptor(),
+			tracing.UnaryClientInterceptor(tracer),
 		),
-		grpc.WithStreamInterceptor(
-			grpc_middleware.ChainStreamClient(
-				grpcMets.StreamClientInterceptor(),
-				tracing.StreamClientInterceptor(tracer),
-			),
+		grpc.WithChainStreamInterceptor(
+			grpcserver.NewStreamClientRequestIDInterceptor(),
+			grpcMets.StreamClientInterceptor(),
+			tracing.StreamClientInterceptor(tracer),
 		),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{Time: 10 * time.Second, Timeout: 5 * time.Second}),
 	}
 	if reg != nil {
 		reg.MustRegister(grpcMets)

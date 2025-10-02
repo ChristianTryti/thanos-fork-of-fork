@@ -12,8 +12,9 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
-	"github.com/hashicorp/golang-lru/simplelru"
-	"github.com/oklog/ulid"
+	"github.com/hashicorp/golang-lru/v2/simplelru"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/prometheus/client_golang/prometheus"
 	promtest "github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/labels"
@@ -72,7 +73,7 @@ func TestInMemoryIndexCache_AvoidsDeadlock(t *testing.T) {
 	})
 	testutil.Ok(t, err)
 
-	l, err := simplelru.NewLRU(math.MaxInt64, func(key, val interface{}) {
+	l, err := simplelru.NewLRU[CacheKey, []byte](math.MaxInt64, func(key CacheKey, val []byte) {
 		// Hack LRU to simulate broken accounting: evictions do not reduce current size.
 		size := cache.curSize
 		cache.onEvict(key, val)
@@ -99,7 +100,7 @@ func TestInMemoryIndexCache_UpdateItem(t *testing.T) {
 	const maxSize = 2 * (sliceHeaderSize + 1)
 
 	var errorLogs []string
-	errorLogger := log.LoggerFunc(func(kvs ...interface{}) error {
+	errorLogger := log.LoggerFunc(func(kvs ...any) error {
 		var lvl string
 		for i := 0; i < len(kvs); i += 2 {
 			if kvs[i] == "level" {
@@ -307,7 +308,7 @@ func TestInMemoryIndexCache_Eviction_WithMetrics(t *testing.T) {
 
 	// Add sliceHeaderSize + 5 + 16 bytes, should fully evict 2 last items.
 	v := []byte{42, 33, 14, 67, 11}
-	for i := 0; i < sliceHeaderSize; i++ {
+	for range sliceHeaderSize {
 		v = append(v, 3)
 	}
 	cache.StorePostings(id, lbls2, v, tenancy.DefaultTenant)

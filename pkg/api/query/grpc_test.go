@@ -12,46 +12,94 @@ import (
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/annotations"
-	v1 "github.com/prometheus/prometheus/web/api/v1"
+	"github.com/thanos-io/promql-engine/api"
+	"github.com/thanos-io/promql-engine/engine"
+	"github.com/thanos-io/promql-engine/logicalplan"
+	equery "github.com/thanos-io/promql-engine/query"
 
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/dedup"
+	"github.com/thanos-io/thanos/pkg/extpromql"
 	"github.com/thanos-io/thanos/pkg/query"
 	"github.com/thanos-io/thanos/pkg/store"
 )
 
+func TestGRPCQueryAPIWithQueryPlan(t *testing.T) {
+	logger := log.NewNopLogger()
+	reg := prometheus.NewRegistry()
+	proxy := store.NewProxyStore(logger, reg, func() []store.Client { return nil }, component.Store, labels.EmptyLabels(), 1*time.Minute, store.LazyRetrieval)
+	queryableCreator := query.NewQueryableCreator(logger, reg, proxy, 1, 1*time.Minute, dedup.AlgorithmPenalty)
+	remoteEndpointsCreator := query.NewRemoteEndpointsCreator(logger, func() []query.Client { return nil }, nil, 1*time.Minute, true, true)
+	lookbackDeltaFunc := func(i int64) time.Duration { return 5 * time.Minute }
+	api := NewGRPCAPI(time.Now, nil, queryableCreator, remoteEndpointsCreator, queryFactory, querypb.EngineType_thanos, lookbackDeltaFunc, 0)
+
+	expr, err := extpromql.ParseExpr("metric")
+	testutil.Ok(t, err)
+	lplan, err := logicalplan.NewFromAST(expr, &equery.Options{}, logicalplan.PlanOptions{})
+	testutil.Ok(t, err)
+	// Create a mock query plan.
+	planBytes, err := logicalplan.Marshal(lplan.Root())
+	testutil.Ok(t, err)
+
+	rangeRequest := &querypb.QueryRangeRequest{
+		Query:            "metric",
+		StartTimeSeconds: 0,
+		IntervalSeconds:  10,
+		EndTimeSeconds:   300,
+		QueryPlan:        &querypb.QueryPlan{Encoding: &querypb.QueryPlan_Json{Json: planBytes}},
+	}
+
+	srv := newQueryRangeServer(context.Background())
+	err = api.QueryRange(rangeRequest, srv)
+	testutil.Ok(t, err)
+
+	// must also handle without query plan.
+	rangeRequest.QueryPlan = nil
+	err = api.QueryRange(rangeRequest, srv)
+	testutil.Ok(t, err)
+
+	instantRequest := &querypb.QueryRequest{
+		Query:          "metric",
+		TimeoutSeconds: 60,
+		QueryPlan:      &querypb.QueryPlan{Encoding: &querypb.QueryPlan_Json{Json: planBytes}},
+	}
+	instSrv := newQueryServer(context.Background())
+	err = api.Query(instantRequest, instSrv)
+	testutil.Ok(t, err)
+}
+
 func TestGRPCQueryAPIErrorHandling(t *testing.T) {
 	logger := log.NewNopLogger()
 	reg := prometheus.NewRegistry()
-	proxy := store.NewProxyStore(logger, reg, func() []store.Client { return nil }, component.Store, nil, 1*time.Minute, store.LazyRetrieval)
-	queryableCreator := query.NewQueryableCreator(logger, reg, proxy, 1, 1*time.Minute)
+	proxy := store.NewProxyStore(logger, reg, func() []store.Client { return nil }, component.Store, labels.EmptyLabels(), 1*time.Minute, store.LazyRetrieval)
+	queryableCreator := query.NewQueryableCreator(logger, reg, proxy, 1, 1*time.Minute, dedup.AlgorithmPenalty)
+	remoteEndpointsCreator := query.NewRemoteEndpointsCreator(logger, func() []query.Client { return nil }, nil, 1*time.Minute, true, true)
 	lookbackDeltaFunc := func(i int64) time.Duration { return 5 * time.Minute }
 	tests := []struct {
-		name   string
-		engine *engineStub
+		name         string
+		queryCreator queryCreatorStub
 	}{
 		{
 			name: "error response",
-			engine: &engineStub{
+			queryCreator: queryCreatorStub{
 				err: errors.New("error stub"),
 			},
 		},
 		{
 			name: "error response",
-			engine: &engineStub{
+			queryCreator: queryCreatorStub{
 				warns: annotations.New().Add(errors.New("warn stub")),
 			},
 		},
 	}
 
 	for _, test := range tests {
-		engineFactory := &QueryEngineFactory{
-			prometheusEngine: test.engine,
-		}
-		api := NewGRPCAPI(time.Now, nil, queryableCreator, engineFactory, querypb.EngineType_prometheus, lookbackDeltaFunc, 0)
+		api := NewGRPCAPI(time.Now, nil, queryableCreator, remoteEndpointsCreator, test.queryCreator, querypb.EngineType_prometheus, lookbackDeltaFunc, 0)
 		t.Run("range_query", func(t *testing.T) {
 			rangeRequest := &querypb.QueryRangeRequest{
 				Query:            "metric",
@@ -62,14 +110,16 @@ func TestGRPCQueryAPIErrorHandling(t *testing.T) {
 			srv := newQueryRangeServer(context.Background())
 			err := api.QueryRange(rangeRequest, srv)
 
-			if test.engine.err != nil {
+			if test.queryCreator.err != nil {
 				testutil.NotOk(t, err)
 				return
 			}
-			if len(test.engine.warns) > 0 {
+			if len(test.queryCreator.warns) > 0 {
 				testutil.Ok(t, err)
 				for i, resp := range srv.responses {
-					testutil.Equals(t, test.engine.warns.AsErrors()[i].Error(), resp.GetWarnings())
+					if resp.GetWarnings() != "" {
+						testutil.Equals(t, test.queryCreator.warns.AsErrors()[i].Error(), resp.GetWarnings())
+					}
 				}
 			}
 		})
@@ -81,32 +131,50 @@ func TestGRPCQueryAPIErrorHandling(t *testing.T) {
 			}
 			srv := newQueryServer(context.Background())
 			err := api.Query(instantRequest, srv)
-			if test.engine.err != nil {
+			if test.queryCreator.err != nil {
 				testutil.NotOk(t, err)
 				return
 			}
-			if len(test.engine.warns) > 0 {
+			if len(test.queryCreator.warns) > 0 {
 				testutil.Ok(t, err)
 				for i, resp := range srv.responses {
-					testutil.Equals(t, test.engine.warns.AsErrors()[i].Error(), resp.GetWarnings())
+					if resp.GetWarnings() != "" {
+						testutil.Equals(t, test.queryCreator.warns.AsErrors()[i].Error(), resp.GetWarnings())
+					}
 				}
 			}
 		})
 	}
 }
 
-type engineStub struct {
-	v1.QueryEngine
+type queryCreatorStub struct {
 	err   error
 	warns annotations.Annotations
 }
 
-func (e engineStub) NewInstantQuery(_ context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, ts time.Time) (promql.Query, error) {
-	return &queryStub{err: e.err, warns: e.warns}, nil
+func (qs queryCreatorStub) makeInstantQuery(
+	ctx context.Context,
+	t PromqlEngineType,
+	q storage.Queryable,
+	e api.RemoteEndpoints,
+	qry planOrQuery,
+	opts *engine.QueryOpts,
+	ts time.Time,
+) (res promql.Query, err error) {
+	return queryStub{err: qs.err, warns: qs.warns}, nil
 }
-
-func (e engineStub) NewRangeQuery(_ context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, start, end time.Time, interval time.Duration) (promql.Query, error) {
-	return &queryStub{err: e.err, warns: e.warns}, nil
+func (qs queryCreatorStub) makeRangeQuery(
+	ctx context.Context,
+	t PromqlEngineType,
+	q storage.Queryable,
+	e api.RemoteEndpoints,
+	qry planOrQuery,
+	opts *engine.QueryOpts,
+	start time.Time,
+	end time.Time,
+	step time.Duration,
+) (res promql.Query, err error) {
+	return queryStub{err: qs.err, warns: qs.warns}, nil
 }
 
 type queryStub struct {

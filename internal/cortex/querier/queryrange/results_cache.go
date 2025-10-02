@@ -7,7 +7,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"github.com/thanos-io/thanos/pkg/extpromql"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -94,12 +96,13 @@ func (PrometheusResponseExtractor) Extract(start, end int64, from Response) Resp
 	return &PrometheusResponse{
 		Status: StatusSuccess,
 		Data: PrometheusData{
-			ResultType:  promRes.Data.ResultType,
-			Result:      extractMatrix(start, end, promRes.Data.Result),
-			Stats:       extractStats(start, end, promRes.Data.Stats),
-			Explanation: promRes.Data.Explanation,
+			ResultType: promRes.Data.ResultType,
+			Result:     extractMatrix(start, end, promRes.Data.Result),
+			Stats:      extractStats(start, end, promRes.Data.Stats),
+			Analysis:   promRes.Data.Analysis,
 		},
-		Headers: promRes.Headers,
+		Headers:  promRes.Headers,
+		Warnings: promRes.Warnings,
 	}
 }
 
@@ -110,11 +113,12 @@ func (PrometheusResponseExtractor) ResponseWithoutHeaders(resp Response) Respons
 	return &PrometheusResponse{
 		Status: StatusSuccess,
 		Data: PrometheusData{
-			ResultType:  promRes.Data.ResultType,
-			Result:      promRes.Data.Result,
-			Stats:       promRes.Data.Stats,
-			Explanation: promRes.Data.Explanation,
+			ResultType: promRes.Data.ResultType,
+			Result:     promRes.Data.Result,
+			Stats:      promRes.Data.Stats,
+			Analysis:   promRes.Data.Analysis,
 		},
+		Warnings: promRes.Warnings,
 	}
 }
 
@@ -124,11 +128,12 @@ func (PrometheusResponseExtractor) ResponseWithoutStats(resp Response) Response 
 	return &PrometheusResponse{
 		Status: StatusSuccess,
 		Data: PrometheusData{
-			ResultType:  promRes.Data.ResultType,
-			Result:      promRes.Data.Result,
-			Explanation: promRes.Data.Explanation,
+			ResultType: promRes.Data.ResultType,
+			Result:     promRes.Data.Result,
+			Analysis:   promRes.Data.Analysis,
 		},
-		Headers: promRes.Headers,
+		Headers:  promRes.Headers,
+		Warnings: promRes.Warnings,
 	}
 }
 
@@ -218,7 +223,7 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	respWithStats := r.GetStats() != "" && s.cacheQueryableSamplesStats
 	if err != nil {
-		return nil, httpgrpc.Errorf(http.StatusBadRequest, err.Error())
+		return nil, httpgrpc.Errorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
 	// If cache_queryable_samples_stats is enabled we always need request the status upstream
@@ -272,11 +277,9 @@ func (s resultsCache) Do(ctx context.Context, r Request) (Response, error) {
 // shouldCacheResponse says whether the response should be cached or not.
 func (s resultsCache) shouldCacheResponse(ctx context.Context, req Request, r Response, maxCacheTime int64) bool {
 	headerValues := getHeaderValuesWithName(r, cacheControlHeader)
-	for _, v := range headerValues {
-		if v == noStoreValue {
-			level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
-			return false
-		}
+	if slices.Contains(headerValues, noStoreValue) {
+		level.Debug(s.logger).Log("msg", fmt.Sprintf("%s header in response is equal to %s, not caching the response", cacheControlHeader, noStoreValue))
+		return false
 	}
 
 	if !s.isAtModifierCachable(req, maxCacheTime) {
@@ -322,7 +325,7 @@ func (s resultsCache) isAtModifierCachable(r Request, maxCacheTime int64) bool {
 	if !strings.Contains(query, "@") {
 		return true
 	}
-	expr, err := parser.ParseExpr(query)
+	expr, err := extpromql.ParseExpr(query)
 	if err != nil {
 		// We are being pessimistic in such cases.
 		level.Warn(s.logger).Log("msg", "failed to parse query, considering @ modifier as not cachable", "query", query, "err", err)
@@ -330,7 +333,12 @@ func (s resultsCache) isAtModifierCachable(r Request, maxCacheTime int64) bool {
 	}
 
 	// This resolves the start() and end() used with the @ modifier.
-	expr = promql.PreprocessExpr(expr, timestamp.Time(r.GetStart()), timestamp.Time(r.GetEnd()))
+	expr, err = promql.PreprocessExpr(expr, timestamp.Time(r.GetStart()), timestamp.Time(r.GetEnd()), time.Duration(r.GetStep())*time.Millisecond)
+	if err != nil {
+		// We are being pessimistic in such cases.
+		level.Warn(s.logger).Log("msg", "failed to preprocess expr", "query", query, "err", err)
+		return false
+	}
 
 	end := r.GetEnd()
 	atModCachable := true
@@ -367,7 +375,7 @@ func (s resultsCache) isOffsetCachable(r Request) bool {
 	if !strings.Contains(query, "offset") {
 		return true
 	}
-	expr, err := parser.ParseExpr(query)
+	expr, err := extpromql.ParseExpr(query)
 	if err != nil {
 		level.Warn(s.logger).Log("msg", "failed to parse query, considering offset as not cachable", "query", query, "err", err)
 		return false

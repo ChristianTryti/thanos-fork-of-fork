@@ -17,7 +17,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,15 +25,16 @@ import (
 
 	"github.com/efficientgo/core/testutil"
 	"github.com/go-kit/log"
-	"github.com/oklog/ulid"
+	"github.com/oklog/ulid/v2"
+
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/promslog"
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
-	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"go.uber.org/atomic"
 	"golang.org/x/sync/errgroup"
@@ -44,7 +44,7 @@ import (
 )
 
 const (
-	defaultPrometheusVersion   = "v0.37.0"
+	defaultPrometheusVersion   = "v0.54.1"
 	defaultAlertmanagerVersion = "v0.20.0"
 	defaultMinioVersion        = "RELEASE.2022-07-30T05-21-40Z"
 
@@ -143,7 +143,7 @@ func ForeachPrometheus(t *testing.T, testFn func(t testing.TB, p *Prometheus)) {
 		paths = PrometheusBinary()
 	}
 
-	for _, path := range strings.Split(paths, " ") {
+	for path := range strings.SplitSeq(paths, " ") {
 		if ok := t.Run(path, func(t *testing.T) {
 			p, err := newPrometheus(path, "")
 			testutil.Ok(t, err)
@@ -431,8 +431,9 @@ func CreateBlock(
 	extLset labels.Labels,
 	resolution int64,
 	hashFunc metadata.HashFunc,
+	sampleTypes []chunkenc.ValueType,
 ) (id ulid.ULID, err error) {
-	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, chunkenc.ValFloat)
+	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, sampleTypes)
 }
 
 // CreateBlockWithTombstone is same as CreateBlock but leaves tombstones which mimics the Prometheus local block.
@@ -445,8 +446,9 @@ func CreateBlockWithTombstone(
 	extLset labels.Labels,
 	resolution int64,
 	hashFunc metadata.HashFunc,
+	sampleTypes []chunkenc.ValueType,
 ) (id ulid.ULID, err error) {
-	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, true, hashFunc, chunkenc.ValFloat)
+	return createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, true, hashFunc, sampleTypes)
 }
 
 // CreateBlockWithBlockDelay writes a block with the given series and numSamples samples each.
@@ -462,8 +464,9 @@ func CreateBlockWithBlockDelay(
 	extLset labels.Labels,
 	resolution int64,
 	hashFunc metadata.HashFunc,
+	sampleTypes []chunkenc.ValueType,
 ) (ulid.ULID, error) {
-	return createBlockWithDelay(ctx, dir, series, numSamples, mint, maxt, blockDelay, extLset, resolution, hashFunc, chunkenc.ValFloat)
+	return createBlockWithDelay(ctx, dir, series, numSamples, mint, maxt, blockDelay, extLset, resolution, hashFunc, sampleTypes)
 }
 
 // CreateHistogramBlockWithDelay writes a block with the given native histogram series and numSamples samples each.
@@ -479,7 +482,7 @@ func CreateHistogramBlockWithDelay(
 	resolution int64,
 	hashFunc metadata.HashFunc,
 ) (id ulid.ULID, err error) {
-	return createBlockWithDelay(ctx, dir, series, numSamples, mint, maxt, blockDelay, extLset, resolution, hashFunc, chunkenc.ValHistogram)
+	return createBlockWithDelay(ctx, dir, series, numSamples, mint, maxt, blockDelay, extLset, resolution, hashFunc, []chunkenc.ValueType{chunkenc.ValHistogram})
 }
 
 // CreateFloatHistogramBlockWithDelay writes a block with the given float native histogram series and numSamples samples each.
@@ -495,11 +498,11 @@ func CreateFloatHistogramBlockWithDelay(
 	resolution int64,
 	hashFunc metadata.HashFunc,
 ) (id ulid.ULID, err error) {
-	return createBlockWithDelay(ctx, dir, series, numSamples, mint, maxt, blockDelay, extLset, resolution, hashFunc, chunkenc.ValFloatHistogram)
+	return createBlockWithDelay(ctx, dir, series, numSamples, mint, maxt, blockDelay, extLset, resolution, hashFunc, []chunkenc.ValueType{chunkenc.ValFloatHistogram})
 }
 
-func createBlockWithDelay(ctx context.Context, dir string, series []labels.Labels, numSamples int, mint int64, maxt int64, blockDelay time.Duration, extLset labels.Labels, resolution int64, hashFunc metadata.HashFunc, samplesType chunkenc.ValueType) (ulid.ULID, error) {
-	blockID, err := createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, samplesType)
+func createBlockWithDelay(ctx context.Context, dir string, series []labels.Labels, numSamples int, mint int64, maxt int64, blockDelay time.Duration, extLset labels.Labels, resolution int64, hashFunc metadata.HashFunc, sampleTypes []chunkenc.ValueType) (ulid.ULID, error) {
+	blockID, err := createBlock(ctx, dir, series, numSamples, mint, maxt, extLset, resolution, false, hashFunc, sampleTypes)
 	if err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "block creation")
 	}
@@ -518,6 +521,9 @@ func createBlockWithDelay(ctx context.Context, dir string, series []labels.Label
 	logger := log.NewNopLogger()
 	m.ULID = id
 	m.Compaction.Sources = []ulid.ULID{id}
+	if blockDelay > 0 {
+		m.Thanos.UploadTime = timestamp.Time(int64(blockID.Time())).Add(-blockDelay)
+	}
 	if err := m.WriteToDir(logger, path.Join(dir, blockID.String())); err != nil {
 		return ulid.ULID{}, errors.Wrap(err, "write meta.json file")
 	}
@@ -535,7 +541,7 @@ func createBlock(
 	resolution int64,
 	tombstones bool,
 	hashFunc metadata.HashFunc,
-	sampleType chunkenc.ValueType,
+	sampleTypes []chunkenc.ValueType,
 ) (id ulid.ULID, err error) {
 	headOpts := tsdb.DefaultHeadOptions()
 	headOpts.ChunkDirRoot = filepath.Join(dir, "chunks")
@@ -558,7 +564,11 @@ func createBlock(
 	r := rand.New(rand.NewSource(int64(numSamples)))
 	var randMutex sync.Mutex
 
-	for len(series) > 0 {
+	if sampleTypes == nil {
+		sampleTypes = []chunkenc.ValueType{chunkenc.ValFloat}
+	}
+
+	for si := atomic.NewInt64(-1); len(series) > 0; {
 		l := batchSize
 		if len(series) < 1000 {
 			l = len(series)
@@ -569,20 +579,25 @@ func createBlock(
 		g.Go(func() error {
 			t := mint
 
-			for i := 0; i < numSamples; i++ {
+			for range numSamples {
 				app := h.Appender(ctx)
 
 				for _, lset := range batch {
 					var err error
-					if sampleType == chunkenc.ValFloat {
+
+					var sampleType = sampleTypes[si.Add(1)%int64(len(sampleTypes))]
+
+					switch sampleType {
+					case chunkenc.ValFloat:
 						randMutex.Lock()
 						_, err = app.Append(0, lset, t, r.Float64())
 						randMutex.Unlock()
-					} else if sampleType == chunkenc.ValHistogram {
+					case chunkenc.ValHistogram:
 						_, err = app.AppendHistogram(0, lset, t, &histogramSample, nil)
-					} else if sampleType == chunkenc.ValFloatHistogram {
+					case chunkenc.ValFloatHistogram:
 						_, err = app.AppendHistogram(0, lset, t, nil, &floatHistogramSample)
 					}
+
 					if err != nil {
 						if rerr := app.Rollback(); rerr != nil {
 							err = errors.Wrapf(err, "rollback failed: %v", rerr)
@@ -602,19 +617,19 @@ func createBlock(
 	if err := g.Wait(); err != nil {
 		return id, err
 	}
-	c, err := tsdb.NewLeveledCompactor(ctx, nil, log.NewNopLogger(), []int64{maxt - mint}, nil, nil)
+	c, err := tsdb.NewLeveledCompactor(ctx, nil, promslog.NewNopLogger(), []int64{maxt - mint}, nil, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "create compactor")
 	}
 
-	id, err = c.Write(dir, h, mint, maxt, nil)
+	ids, err := c.Write(dir, h, mint, maxt, nil)
 	if err != nil {
 		return id, errors.Wrap(err, "write block")
 	}
-
-	if id.Compare(ulid.ULID{}) == 0 {
+	if len(ids) == 0 {
 		return id, errors.Errorf("nothing to write, asked for %d samples", numSamples)
 	}
+	id = ids[0]
 
 	blockDir := filepath.Join(dir, id.String())
 	logger := log.NewNopLogger()
@@ -668,7 +683,7 @@ func createBlock(
 }
 
 func gatherMaxSeriesSize(ctx context.Context, fn string) (int64, error) {
-	r, err := index.NewFileReader(fn)
+	r, err := index.NewFileReader(fn, index.DecodePostingsRaw)
 	if err != nil {
 		return 0, errors.Wrap(err, "open index file")
 	}
@@ -711,103 +726,110 @@ func gatherMaxSeriesSize(ctx context.Context, fn string) (int64, error) {
 	return maxSeriesSize, nil
 }
 
-var indexFilename = "index"
+// CreateBlockWithChurn writes a block with the given series. Start time of each series
+// will be randomized in the given time window to create churn. Only float chunk is supported right now.
+func CreateBlockWithChurn(
+	ctx context.Context,
+	rnd *rand.Rand,
+	dir string,
+	series []labels.Labels,
+	numSamples int,
+	mint, maxt int64,
+	extLset labels.Labels,
+	resolution int64,
+	scrapeInterval int64,
+	seriesSize int64,
+) (id ulid.ULID, err error) {
+	headOpts := tsdb.DefaultHeadOptions()
+	headOpts.ChunkDirRoot = filepath.Join(dir, "chunks")
+	headOpts.ChunkRange = 10000000000
+	h, err := tsdb.NewHead(nil, nil, nil, nil, headOpts, nil)
+	if err != nil {
+		return id, errors.Wrap(err, "create head block")
+	}
+	defer func() {
+		runutil.CloseWithErrCapture(&err, h, "TSDB Head")
+		if e := os.RemoveAll(headOpts.ChunkDirRoot); e != nil {
+			err = errors.Wrap(e, "delete chunks dir")
+		}
+	}()
 
-type indexWriterSeries struct {
-	labels labels.Labels
-	chunks []chunks.Meta // series file offset of chunks
+	app := h.Appender(ctx)
+	for i := range series {
+
+		var ref storage.SeriesRef
+		start := RandRange(rnd, mint, maxt)
+		for j := range numSamples {
+			if ref == 0 {
+				ref, err = app.Append(0, series[i], start, float64(i+j))
+			} else {
+				ref, err = app.Append(ref, series[i], start, float64(i+j))
+			}
+			if err != nil {
+				if rerr := app.Rollback(); rerr != nil {
+					err = errors.Wrapf(err, "rollback failed: %v", rerr)
+				}
+				return id, errors.Wrap(err, "add sample")
+			}
+			start += scrapeInterval
+			if start > maxt {
+				break
+			}
+		}
+	}
+	if err := app.Commit(); err != nil {
+		return id, errors.Wrap(err, "commit")
+	}
+
+	c, err := tsdb.NewLeveledCompactor(ctx, nil, promslog.NewNopLogger(), []int64{maxt - mint}, nil, nil)
+	if err != nil {
+		return id, errors.Wrap(err, "create compactor")
+	}
+
+	ids, err := c.Write(dir, h, mint, maxt, nil)
+	if err != nil {
+		return id, errors.Wrap(err, "write block")
+	}
+
+	if len(ids) == 0 {
+		return id, errors.Errorf("nothing to write, asked for %d samples", numSamples)
+	}
+	id = ids[0]
+
+	blockDir := filepath.Join(dir, id.String())
+	logger := log.NewNopLogger()
+
+	if _, err = metadata.InjectThanos(logger, blockDir, metadata.Thanos{
+		Labels:     extLset.Map(),
+		Downsample: metadata.ThanosDownsample{Resolution: resolution},
+		Source:     metadata.TestSource,
+		IndexStats: metadata.IndexStats{SeriesMaxSize: seriesSize},
+	}, nil); err != nil {
+		return id, errors.Wrap(err, "finalize block")
+	}
+
+	return id, nil
 }
 
-type indexWriterSeriesSlice []*indexWriterSeries
-
-// PutOutOfOrderIndex updates the index in blockDir with an index containing an out-of-order chunk
-// copied from https://github.com/prometheus/prometheus/blob/b1ed4a0a663d0c62526312311c7529471abbc565/tsdb/index/index_test.go#L346
-func PutOutOfOrderIndex(blockDir string, minTime int64, maxTime int64) error {
-
-	if minTime >= maxTime || minTime+4 >= maxTime {
-		return fmt.Errorf("minTime must be at least 4 less than maxTime to not create overlapping chunks")
-	}
-
-	lbls := []labels.Labels{
-		labels.FromStrings("lbl1", "1"),
-	}
-
-	// Sort labels as the index writer expects series in sorted order.
-	sort.Sort(labels.Slice(lbls))
-
-	symbols := map[string]struct{}{}
-	for _, lset := range lbls {
-		lset.Range(func(l labels.Label) {
-			symbols[l.Name] = struct{}{}
-			symbols[l.Value] = struct{}{}
-		})
-	}
-
-	var input indexWriterSeriesSlice
-
-	// Generate ChunkMetas for every label set.
-	// Ignoring gosec as it is only used for tests.
-	for _, lset := range lbls {
-		var metas []chunks.Meta
-		// only need two chunks that are out-of-order
-		chk1 := chunks.Meta{
-			MinTime: maxTime - 2,
-			MaxTime: maxTime - 1,
-			Ref:     chunks.ChunkRef(rand.Uint64()), // nolint:gosec
-			Chunk:   chunkenc.NewXORChunk(),
-		}
-		metas = append(metas, chk1)
-		chk2 := chunks.Meta{
-			MinTime: minTime + 1,
-			MaxTime: minTime + 2,
-			Ref:     chunks.ChunkRef(rand.Uint64()), // nolint:gosec
-			Chunk:   chunkenc.NewXORChunk(),
-		}
-		metas = append(metas, chk2)
-
-		input = append(input, &indexWriterSeries{
-			labels: lset,
-			chunks: metas,
-		})
-	}
-
-	iw, err := index.NewWriter(context.Background(), filepath.Join(blockDir, indexFilename))
+// AddDelay rewrites a given block with delay.
+func AddDelay(blockID ulid.ULID, dir string, blockDelay time.Duration) (ulid.ULID, error) {
+	id, err := ulid.New(uint64(timestamp.FromTime(timestamp.Time(int64(blockID.Time())).Add(-blockDelay))), bytes.NewReader(blockID.Entropy()))
 	if err != nil {
-		return err
+		return ulid.ULID{}, errors.Wrap(err, "create block id")
 	}
 
-	syms := []string{}
-	for s := range symbols {
-		syms = append(syms, s)
-	}
-	sort.Strings(syms)
-	for _, s := range syms {
-		if err := iw.AddSymbol(s); err != nil {
-			return err
-		}
+	bdir := path.Join(dir, blockID.String())
+	m, err := metadata.ReadFromDir(bdir)
+	if err != nil {
+		return ulid.ULID{}, errors.Wrap(err, "open meta file")
 	}
 
-	// Population procedure as done by compaction.
-	var (
-		postings = index.NewMemPostings()
-		values   = map[string]map[string]struct{}{}
-	)
-
-	for i, s := range input {
-		if err := iw.AddSeries(storage.SeriesRef(i), s.labels, s.chunks...); err != nil {
-			return err
-		}
-
-		s.labels.Range(func(l labels.Label) {
-			valset, ok := values[l.Name]
-			if !ok {
-				valset = map[string]struct{}{}
-				values[l.Name] = valset
-			}
-			valset[l.Value] = struct{}{}
-		})
-		postings.Add(storage.SeriesRef(i), s.labels)
+	logger := log.NewNopLogger()
+	m.ULID = id
+	m.Compaction.Sources = []ulid.ULID{id}
+	if err := m.WriteToDir(logger, path.Join(dir, blockID.String())); err != nil {
+		return ulid.ULID{}, errors.Wrap(err, "write meta.json file")
 	}
 
-	return iw.Close()
+	return id, os.Rename(path.Join(dir, blockID.String()), path.Join(dir, id.String()))
 }
